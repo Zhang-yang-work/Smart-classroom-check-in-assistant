@@ -17,7 +17,7 @@ root-portal {
   --card-foreground: lab(2.75381% 0 0);
   --popover: lab(100% 0 0);
   --popover-foreground: lab(2.75381% 0 0);
-  --primary: lab(7.78201% -0.0000149012 0);
+  --primary: #16a34a;
   --primary-foreground: lab(98.26% 0 0);
   --secondary: lab(96.52% -0.0000298023 0.0000119209);
   --secondary-foreground: lab(7.78201% -0.0000149012 0);
@@ -29,15 +29,15 @@ root-portal {
   --destructive-foreground: lab(96.4152% 3.22586 1.14673);
   --border: lab(90.952% 0 -0.0000119209);
   --input: lab(90.952% 0 -0.0000119209);
-  --ring: lab(66.128% -0.0000298023 0.0000119209);
+  --ring: #16a34a;
   --sidebar: lab(98.26% 0 0);
   --sidebar-foreground: lab(2.75381% 0 0);
-  --sidebar-primary: lab(7.78201% -0.0000149012 0);
+  --sidebar-primary: #16a34a;
   --sidebar-primary-foreground: lab(98.26% 0 0);
   --sidebar-accent: lab(96.52% -0.0000298023 0.0000119209);
   --sidebar-accent-foreground: lab(7.78201% -0.0000149012 0);
   --sidebar-border: lab(90.952% 0 -0.0000119209);
-  --sidebar-ring: lab(66.128% -0.0000298023 0.0000119209);
+  --sidebar-ring: #16a34a;
   --surface: lab(97.68% -0.0000298023 0.0000119209);
   --code: var(--surface);
   --code-highlight: lab(95.36% 0 0);

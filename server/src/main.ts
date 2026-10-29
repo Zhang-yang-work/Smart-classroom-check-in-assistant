@@ -2,6 +2,8 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from '@/app.module';
 import * as express from 'express';
 import { HttpStatusInterceptor } from '@/interceptors/http-status.interceptor';
+import { TransformInterceptor } from '@/interceptors/transform.interceptor';
+import { AllExceptionsFilter } from '@/filters/http-exception.filter';
 
 function parsePort(): number {
   const args = process.argv.slice(2);
@@ -33,7 +35,9 @@ async function bootstrap() {
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
   // 全局拦截器：统一将 POST 请求的 201 状态码改为 200
-  app.useGlobalInterceptors(new HttpStatusInterceptor());
+  app.useGlobalInterceptors(new HttpStatusInterceptor(), new TransformInterceptor());
+  // 全局异常过滤器：统一错误响应信封
+  app.useGlobalFilters(new AllExceptionsFilter());
   // 1. 开启优雅关闭 Hooks (关键!)
   app.enableShutdownHooks();
 
