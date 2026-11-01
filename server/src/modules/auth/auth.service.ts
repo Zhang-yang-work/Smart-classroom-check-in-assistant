@@ -71,6 +71,37 @@ export class AuthService {
     };
   }
 
+  async studentLogin(body: { student_no: string; name: string }) {
+    const studentNo = (body.student_no || '').trim();
+    const name = (body.name || '').trim();
+    if (!studentNo || !name) throw new BadRequestException('学号与姓名均不能为空');
+
+    const client = getSupabaseClient();
+    const { data, error } = await client
+      .from('users')
+      .select('id, role, name, student_no')
+      .eq('role', 'student')
+      .eq('student_no', studentNo)
+      .eq('name', name)
+      .maybeSingle();
+    if (error) throw new BadRequestException(`登录失败: ${error.message}`);
+    if (!data) {
+      throw new BadRequestException('未找到已绑定账号，请使用老师发放的绑定码完成首次绑定');
+    }
+
+    const token = randomUUID();
+    const { error: tokenErr } = await client
+      .from('users')
+      .update({ token })
+      .eq('id', data.id);
+    if (tokenErr) throw new BadRequestException(`登录失败: ${tokenErr.message}`);
+
+    return {
+      token,
+      user: { id: data.id, role: 'student' as const, name: data.name, student_no: data.student_no },
+    };
+  }
+
   async teacherLogin(body: { name: string; teacher_code: string }) {
     const name = (body.name || '').trim();
     const code = (body.teacher_code || '').trim();

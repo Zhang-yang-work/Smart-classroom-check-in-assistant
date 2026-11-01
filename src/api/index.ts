@@ -52,6 +52,13 @@ export function bindStudent(data: {
   return request({ url: '/api/auth/bind', method: 'POST', data });
 }
 
+export function studentLogin(data: {
+  student_no: string;
+  name: string;
+}): Promise<{ token: string; user: User }> {
+  return request({ url: '/api/auth/student-login', method: 'POST', data });
+}
+
 export function teacherLogin(data: {
   name: string;
   teacher_code: string;

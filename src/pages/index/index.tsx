@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { GraduationCap } from 'lucide-react-taro';
-import { bindStudent, teacherLogin, getMe } from '@/api';
+import { bindStudent, studentLogin, teacherLogin, getMe } from '@/api';
 import { setSession, getToken } from '@/utils/storage';
 
 export default function IndexPage() {
@@ -40,19 +40,25 @@ export default function IndexPage() {
   };
 
   const handleStudentSubmit = async () => {
-    if (!studentNo || !studentName || !bindingCode) {
-      Taro.showToast({ title: '请填写完整信息', icon: 'none' });
+    if (!studentNo.trim() || !studentName.trim()) {
+      Taro.showToast({ title: '请填写学号与姓名', icon: 'none' });
       return;
     }
+    const isFirstBind = bindingCode.trim().length > 0;
     setLoading(true);
     try {
-      const res = await bindStudent({
-        student_no: studentNo,
-        name: studentName,
-        binding_code: bindingCode,
-      });
+      const res = isFirstBind
+        ? await bindStudent({
+            student_no: studentNo.trim(),
+            name: studentName.trim(),
+            binding_code: bindingCode.trim(),
+          })
+        : await studentLogin({
+            student_no: studentNo.trim(),
+            name: studentName.trim(),
+          });
       setSession(res.token, res.user);
-      Taro.showToast({ title: '绑定成功', icon: 'success' });
+      Taro.showToast({ title: isFirstBind ? '绑定成功' : '登录成功', icon: 'success' });
       redirectByRole('student');
     } catch (e) {
       showErr(e);
@@ -62,13 +68,13 @@ export default function IndexPage() {
   };
 
   const handleTeacherSubmit = async () => {
-    if (!teacherName || !teacherCode) {
+    if (!teacherName.trim() || !teacherCode.trim()) {
       Taro.showToast({ title: '请填写姓名与教师口令', icon: 'none' });
       return;
     }
     setLoading(true);
     try {
-      const res = await teacherLogin({ name: teacherName, teacher_code: teacherCode });
+      const res = await teacherLogin({ name: teacherName.trim(), teacher_code: teacherCode.trim() });
       setSession(res.token, res.user);
       Taro.showToast({ title: '登录成功', icon: 'success' });
       redirectByRole('teacher');
@@ -119,16 +125,18 @@ export default function IndexPage() {
                 />
               </View>
               <View>
-                <Text className="block text-sm font-medium text-foreground mb-2">绑定码</Text>
+                <Text className="block text-sm font-medium text-foreground mb-2">
+                  绑定码（首次绑定必填）
+                </Text>
                 <Input
                   type="text"
-                  placeholder="请输入老师发放的一次性绑定码"
+                  placeholder="已绑定的同学可留空直接登录"
                   value={bindingCode}
                   onInput={(e) => setBindingCode((e as any).detail.value)}
                 />
               </View>
               <Button className="w-full" disabled={loading} onClick={handleStudentSubmit}>
-                绑定并进入
+                进入
               </Button>
             </TabsContent>
 
@@ -160,7 +168,7 @@ export default function IndexPage() {
       </Card>
 
       <Text className="block text-center text-xs text-muted-foreground mt-8">
-        学生凭一次性绑定码完成身份绑定，教师凭管理员口令登录
+        学生首次凭绑定码绑定，之后凭学号+姓名登录；教师凭管理员口令登录
       </Text>
     </View>
   );

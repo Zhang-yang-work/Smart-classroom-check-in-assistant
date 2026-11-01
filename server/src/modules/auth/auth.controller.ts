@@ -11,6 +11,11 @@ export class AuthController {
     return this.authService.bindStudent(body);
   }
 
+  @Post('student-login')
+  async studentLogin(@Body() body: any) {
+    return this.authService.studentLogin(body);
+  }
+
   @Post('teacher-login')
   async teacherLogin(@Body() body: any) {
     return this.authService.teacherLogin(body);
