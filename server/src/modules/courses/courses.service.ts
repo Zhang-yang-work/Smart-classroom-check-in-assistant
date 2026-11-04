@@ -1,5 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { randomBytes } from 'crypto';
+import { promises as fs } from 'fs';
+import * as XLSX from 'xlsx';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AuthUser, requireTeacher } from '@/common/auth';
 
@@ -11,6 +13,92 @@ function randomCode(length = 6): string {
     out += chars[bytes[i] % chars.length];
   }
   return out;
+}
+
+export interface UploadedFileLike {
+  originalname?: string;
+  buffer?: Buffer;
+  path?: string;
+  mimetype?: string;
+  size?: number;
+}
+
+function normalizeCell(v: unknown): string {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'number') return Number.isInteger(v) ? String(v) : String(v);
+  return String(v).trim();
+}
+
+function parseExcelToStudents(
+  buffer: Buffer,
+): Array<{ student_no: string; student_name: string }> {
+  let workbook: XLSX.WorkBook;
+  try {
+    workbook = XLSX.read(buffer, { type: 'buffer' });
+  } catch (e) {
+    throw new BadRequestException(`无法解析 Excel 文件: ${(e as Error).message}`);
+  }
+
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new BadRequestException('Excel 文件内容为空');
+
+  const sheet = workbook.Sheets[sheetName];
+  const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: '',
+  });
+  if (!rows || rows.length === 0) throw new BadRequestException('Excel 无数据行');
+
+  // 首行判定是否为表头
+  const header = rows[0].map((c) =>
+    String(c ?? '').trim().toLowerCase().replace(/\s+/g, ''),
+  );
+  const hasHeader = header.some(
+    (h) =>
+      h.includes('学号') ||
+      h.includes('姓名') ||
+      h.includes('名字') ||
+      h.includes('编号') ||
+      h.includes('name') ||
+      h.includes('student'),
+  );
+
+  let noCol = -1;
+  let nameCol = -1;
+  let dataStart = 0;
+
+  if (hasHeader) {
+    noCol = header.findIndex(
+      (h) =>
+        h.includes('学号') ||
+        h.includes('编号') ||
+        h.includes('student') ||
+        h.includes('no') ||
+        h.includes('id'),
+    );
+    nameCol = header.findIndex(
+      (h) =>
+        h.includes('姓名') ||
+        h.includes('名字') ||
+        h.includes('name') ||
+        h.includes('学生'),
+    );
+    if (noCol < 0) noCol = 0;
+    if (nameCol < 0) nameCol = 1;
+    dataStart = 1;
+  } else {
+    noCol = 0;
+    nameCol = 1;
+    dataStart = 0;
+  }
+
+  const students: Array<{ student_no: string; student_name: string }> = [];
+  for (let i = dataStart; i < rows.length; i++) {
+    const no = normalizeCell(rows[i]?.[noCol]);
+    const name = String(rows[i]?.[nameCol] ?? '').trim();
+    if (no && name) students.push({ student_no: no, student_name: name });
+  }
+  return students;
 }
 
 @Injectable()
@@ -107,6 +195,32 @@ export class CoursesService {
       count: rows.length,
     });
     return data || [];
+  }
+
+  async importRosterExcel(user: AuthUser, courseId: string, file: UploadedFileLike) {
+    requireTeacher(user);
+    if (!file) throw new BadRequestException('请选择要上传的 Excel 文件');
+
+    const filename = (file.originalname || '').toLowerCase();
+    if (!filename.endsWith('.xlsx') && !filename.endsWith('.xls')) {
+      throw new BadRequestException('仅支持 .xlsx / .xls 格式的 Excel 文件');
+    }
+
+    let buffer: Buffer;
+    if (file.buffer && file.buffer.length > 0) {
+      buffer = file.buffer;
+    } else if (file.path) {
+      buffer = await fs.readFile(file.path);
+    } else {
+      throw new BadRequestException('无法读取上传文件内容');
+    }
+
+    const students = parseExcelToStudents(buffer);
+    if (students.length === 0) {
+      throw new BadRequestException('Excel 中未解析到有效学生（需包含学号、姓名两列）');
+    }
+
+    return this.importRoster(user, courseId, students);
   }
 
   async getRoster(user: AuthUser, courseId: string) {

@@ -94,6 +94,34 @@ export function getRoster(courseId: string): Promise<RosterItem[]> {
   return request({ url: `/api/courses/${courseId}/roster` });
 }
 
+export function importRosterExcel(courseId: string, filePath: string): Promise<RosterItem[]> {
+  const header: Record<string, string> = {};
+  const token = getToken();
+  if (token) header.Authorization = `Bearer ${token}`;
+
+  const url = `/api/courses/${courseId}/roster/import-excel`;
+  console.log('[API UPLOAD]', JSON.stringify({ url, name: 'file', filePath, header }));
+
+  return (Network.uploadFile({
+    url,
+    filePath,
+    name: 'file',
+    header,
+  } as any) as unknown as Promise<{ statusCode: number; data: string }>).then((res: any) => {
+    console.log('[API UPLOAD RESPONSE]', JSON.stringify({ statusCode: res?.statusCode, data: res?.data }));
+    let body: ApiEnvelope<RosterItem[]> | undefined;
+    try {
+      body = typeof res?.data === 'string' ? JSON.parse(res.data) : res?.data;
+    } catch {
+      body = undefined;
+    }
+    if (!res || res.statusCode >= 400 || !body || body.code !== 0) {
+      throw new Error(body?.msg || '上传失败，请稍后重试');
+    }
+    return (body.data ?? null) as RosterItem[];
+  });
+}
+
 // ---- 签到 ----
 export function createTask(data: {
   course_id: string;

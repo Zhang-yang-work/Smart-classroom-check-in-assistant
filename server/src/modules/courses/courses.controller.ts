@@ -1,5 +1,15 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
-import { CoursesService } from './courses.service';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { CoursesService, UploadedFileLike } from './courses.service';
 import { AuthGuard, CurrentUser, AuthUser } from '@/common/auth';
 
 @Controller('courses')
@@ -24,6 +34,16 @@ export class CoursesController {
     @Body() body: any,
   ) {
     return this.coursesService.importRoster(user, id, body.students || []);
+  }
+
+  @Post(':id/roster/import-excel')
+  @UseInterceptors(FileInterceptor('file'))
+  async importExcel(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @UploadedFile() file: UploadedFileLike,
+  ) {
+    return this.coursesService.importRosterExcel(user, id, file);
   }
 
   @Get(':id/roster')

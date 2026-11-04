@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import Taro, { useLoad } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Card, CardContent } from '@/components/ui/card';
@@ -9,8 +9,8 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
 import { Separator } from '@/components/ui/separator';
-import { Plus, Users } from 'lucide-react-taro';
-import { listCourses, createCourse, importRoster, getRoster } from '@/api';
+import { Plus, Users, FileSpreadsheet } from 'lucide-react-taro';
+import { listCourses, createCourse, importRoster, getRoster, importRosterExcel } from '@/api';
 import type { Course, RosterItem } from '@/api/types';
 
 function parseRoster(text: string) {
@@ -26,6 +26,11 @@ function parseRoster(text: string) {
 }
 
 export default function CoursePage() {
+  const env = Taro.getEnv();
+  const isMiniApp = env === Taro.ENV_TYPE.WEAPP || env === Taro.ENV_TYPE.TT;
+  const isWeb = env === Taro.ENV_TYPE.WEB;
+  const excelInputRef = useRef<any>(null);
+
   const [courses, setCourses] = useState<Course[]>([]);
   const [newName, setNewName] = useState('');
   const [loading, setLoading] = useState(true);
@@ -36,6 +41,7 @@ export default function CoursePage() {
   const [importCourseId, setImportCourseId] = useState('');
   const [importText, setImportText] = useState('');
   const [importing, setImporting] = useState(false);
+  const [excelImporting, setExcelImporting] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -111,6 +117,48 @@ export default function CoursePage() {
     }
   };
 
+  const doImportExcel = async (courseId: string, filePath: string) => {
+    setExcelImporting(true);
+    try {
+      const rows = await importRosterExcel(courseId, filePath);
+      Taro.showToast({ title: `已导入 ${rows.length} 人`, icon: 'success' });
+      if (expandedId === courseId) {
+        setRoster((await getRoster(courseId)) || []);
+      }
+    } catch (e) {
+      Taro.showToast({ title: (e as Error).message, icon: 'none' });
+    } finally {
+      setExcelImporting(false);
+      if (excelInputRef.current) excelInputRef.current.value = '';
+    }
+  };
+
+  const handleImportExcel = (courseId: string) => {
+    setImportCourseId(courseId);
+    if (isMiniApp) {
+      Taro.chooseMessageFile({
+        count: 1,
+        type: 'file',
+        extension: ['xlsx', 'xls'],
+        success: (res) => {
+          const f = res.tempFiles?.[0];
+          if (f?.path) doImportExcel(courseId, f.path);
+          else Taro.showToast({ title: '未选择文件', icon: 'none' });
+        },
+        fail: () => {},
+      });
+    } else if (isWeb) {
+      excelInputRef.current?.click?.();
+    }
+  };
+
+  const handleExcelFileChange = (e: any) => {
+    const file = e?.target?.files?.[0];
+    if (!file) return;
+    const objectUrl = URL.createObjectURL(file);
+    doImportExcel(importCourseId, objectUrl);
+  };
+
   return (
     <View className="min-h-full flex flex-col px-5 py-6 pb-10">
       <View className="flex items-center gap-2 mb-4">
@@ -161,7 +209,11 @@ export default function CoursePage() {
                   <Text className="block text-base font-semibold text-foreground">{c.name}</Text>
                   <View className="flex items-center gap-2">
                     <Button size="sm" variant="outline" onClick={() => openImport(c.id)}>
-                      导入名单
+                      粘贴导入
+                    </Button>
+                    <Button size="sm" variant="outline" disabled={excelImporting} onClick={() => handleImportExcel(c.id)}>
+                      <FileSpreadsheet size={14} className="mr-1" color="#16a34a" />
+                      Excel导入
                     </Button>
                     <Button size="sm" variant="ghost" onClick={() => toggleCourse(c.id)}>
                       {expandedId === c.id ? '收起' : '查看名单'}
@@ -235,6 +287,16 @@ export default function CoursePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {isWeb && (
+        <input
+          ref={excelInputRef}
+          type="file"
+          accept=".xlsx,.xls"
+          style={{ display: 'none' }}
+          onChange={handleExcelFileChange}
+        />
+      )}
     </View>
   );
 }
