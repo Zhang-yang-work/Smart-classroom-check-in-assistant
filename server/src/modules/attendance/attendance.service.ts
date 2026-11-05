@@ -2,6 +2,12 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AuthUser, requireTeacher, requireStudent } from '@/common/auth';
 
+// 根据截止时间动态归一化状态：数据库仅存 active，过期后应视为 ended
+function resolveTaskStatus(status: string, end_at: string): string {
+  if (status !== 'active') return 'ended';
+  return Date.now() <= new Date(end_at).getTime() ? 'active' : 'ended';
+}
+
 export interface TaskRow {
   id: string;
   course_id: string;
@@ -155,6 +161,8 @@ export class AttendanceService {
       .maybeSingle();
     if (error || !task) throw new BadRequestException('签到任务不存在');
 
+    const taskView = { ...task, status: resolveTaskStatus(task.status, task.end_at) };
+
     const { data: participants, error: pErr } = await client
       .from('attendance_participants')
       .select('student_no, student_name')
@@ -172,7 +180,7 @@ export class AttendanceService {
 
     if (user.role === 'teacher') {
       return {
-        task,
+        task: taskView,
         participants: (participants || []).map((p) => {
           const rec = recordMap.get(p.student_no);
           return {
@@ -198,7 +206,7 @@ export class AttendanceService {
     // 学生：仅返回本人是否已签到
     const myRecord = recordMap.get(user.student_no || '');
     return {
-      task,
+      task: taskView,
       my_status: myRecord?.status || 'unsigned',
       signed_at: myRecord?.signed_at || null,
     };
@@ -332,6 +340,7 @@ export class AttendanceService {
       }
       const result: TaskRow = {
         ...t,
+        status: resolveTaskStatus(t.status, t.end_at),
         course_name: courseName.get(t.course_id) || '未知课程',
         total: totalMap.get(t.id) || 0,
         signed_count: signedCount,
