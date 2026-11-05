@@ -197,6 +197,17 @@ export default defineConfig<'vite'>(async (merge, _env) => {
           '/api': {
             target: `http://localhost:${serverPort}`,
             changeOrigin: true,
+            bypass(req) {
+              const url = req.url;
+              const pathname = url?.split('?', 1)[0];
+              // Vite serves src/api at /api in H5 dev. Keep other paths proxied to NestJS.
+              if (
+                (req.method === 'GET' || req.method === 'HEAD') &&
+                (pathname === '/api/index.ts' || pathname === '/api/types.ts')
+              ) {
+                return url;
+              }
+            },
           },
         },
       },
