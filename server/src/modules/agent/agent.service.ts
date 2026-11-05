@@ -208,7 +208,7 @@ export class AgentService {
 
     const { data, error } = await client
       .from('course_roster')
-      .select('student_no, student_name, binding_code, linked_user_id')
+      .select('student_no, student_name')
       .eq('course_id', courseId)
       .order('student_no', { ascending: true });
     if (error) throw new Error(error.message);

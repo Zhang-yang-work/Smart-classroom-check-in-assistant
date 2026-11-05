@@ -1,6 +1,8 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AuthUser, requireTeacher, requireStudent } from '@/common/auth';
+
+const TASK_COLUMNS = 'id, course_id, mode, start_at, end_at, status, created_at';
 
 // 根据截止时间动态归一化状态：数据库仅存 active，过期后应视为 ended
 function resolveTaskStatus(status: string, end_at: string): string {
@@ -22,7 +24,6 @@ export interface TaskRow {
   total?: number;
   signed_count?: number;
   makeup_count?: number;
-  my_status?: string;
 }
 
 @Injectable()
@@ -112,37 +113,36 @@ export class AttendanceService {
       .limit(100);
     if (tErr) throw new BadRequestException(`查询签到失败: ${tErr.message}`);
 
-    return this.enrichTasks(client, tasks || [], courseName, null);
+    return this.enrichTasks(client, tasks || [], courseName);
   }
 
   // 学生：进行中 + 历史（含本人签到状态）
   async listTasksForStudent(user: AuthUser) {
     requireStudent(user);
+    const studentNo = user.student_no;
+    if (!studentNo) return { ongoing: [], history: [] };
+
     const client = getSupabaseClient();
-    const { data: roster, error: rErr } = await client
-      .from('course_roster')
-      .select('course_id')
-      .eq('linked_user_id', user.id);
-    if (rErr) throw new BadRequestException(`查询课程失败: ${rErr.message}`);
-    const courseIds = Array.from(new Set((roster || []).map((r) => r.course_id)));
-    if (courseIds.length === 0) return { ongoing: [], history: [] };
-
-    const { data: courses, error: cErr } = await client
-      .from('courses')
-      .select('id, name')
-      .in('id', courseIds);
-    if (cErr) throw new BadRequestException(`查询课程失败: ${cErr.message}`);
-    const courseName = new Map((courses || []).map((c) => [c.id, c.name]));
-
-    const { data: tasks, error: tErr } = await client
-      .from('attendance_tasks')
-      .select('id, course_id, mode, start_at, end_at, status, created_at')
-      .in('course_id', courseIds)
+    const { data: tasks, error: taskError } = await this.studentTasks(client, studentNo)
       .order('created_at', { ascending: false })
       .limit(100);
-    if (tErr) throw new BadRequestException(`查询签到失败: ${tErr.message}`);
+    if (taskError) throw new BadRequestException('查询签到失败');
+    if (!tasks?.length) return { ongoing: [], history: [] };
 
-    const enriched = await this.enrichTasks(client, tasks || [], courseName, user.student_no);
+    const { data: records, error: recordError } = await client
+      .from('attendance_records')
+      .select('task_id, status')
+      .in('task_id', tasks.map((task) => task.id))
+      .eq('student_no', studentNo);
+    if (recordError) throw new BadRequestException('读取签到记录失败');
+
+    const statuses = new Map((records || []).map((record) => [record.task_id, record.status]));
+    const enriched = tasks.map(({ courses, ...task }) => ({
+      ...task,
+      course_name: (courses as unknown as { name: string } | null)?.name || '未知课程',
+      status: resolveTaskStatus(task.status, task.end_at),
+      my_status: statuses.get(task.id) || 'unsigned',
+    }));
 
     const now = Date.now();
     const ongoing = enriched.filter((t) => t.status === 'active' && new Date(t.end_at).getTime() > now);
@@ -154,13 +154,26 @@ export class AttendanceService {
   // 任务详情：教师看到全员名单状态，学生看到本人状态
   async getTaskDetail(user: AuthUser, taskId: string) {
     const client = getSupabaseClient();
-    const { data: task, error } = await client
-      .from('attendance_tasks')
-      .select('id, course_id, mode, start_at, end_at, status, created_at, courses(name)')
-      .eq('id', taskId)
-      .maybeSingle();
-    if (error || !task) throw new BadRequestException('签到任务不存在');
+    if (user.role !== 'teacher') {
+      requireStudent(user);
+      const studentNo = user.student_no;
+      const task = await this.requireStudentTask(client, studentNo, taskId);
+      const { data: record, error } = await client
+        .from('attendance_records')
+        .select('status, signed_at')
+        .eq('task_id', taskId)
+        .eq('student_no', studentNo)
+        .maybeSingle();
+      if (error) throw new BadRequestException('读取签到记录失败');
 
+      return {
+        task: { ...task, status: resolveTaskStatus(task.status, task.end_at) },
+        my_status: record?.status || 'unsigned',
+        signed_at: record?.signed_at || null,
+      };
+    }
+
+    const task = await this.requireOwnedTask(client, user.id, taskId);
     const taskView = { ...task, status: resolveTaskStatus(task.status, task.end_at) };
 
     const { data: participants, error: pErr } = await client
@@ -178,60 +191,36 @@ export class AttendanceService {
 
     const recordMap = new Map((records || []).map((r) => [r.student_no, r]));
 
-    if (user.role === 'teacher') {
-      return {
-        task: taskView,
-        participants: (participants || []).map((p) => {
-          const rec = recordMap.get(p.student_no);
-          return {
-            student_no: p.student_no,
-            student_name: p.student_name,
-            status: rec?.status || 'absent',
-            signed_at: rec?.signed_at || null,
-            makeup_at: rec?.makeup_at || null,
-            makeup_reason: rec?.makeup_reason || null,
-          };
-        }),
-        summary: {
-          total: (participants || []).length,
-          signed: (records || []).filter((r) => r.status === 'signed').length,
-          makeup: (records || []).filter((r) => r.status === 'makeup').length,
-          absent:
-            (participants || []).length -
-            (records || []).filter((r) => r.status === 'signed' || r.status === 'makeup').length,
-        },
-      };
-    }
-
-    // 学生：仅返回本人是否已签到
-    const myRecord = recordMap.get(user.student_no || '');
     return {
       task: taskView,
-      my_status: myRecord?.status || 'unsigned',
-      signed_at: myRecord?.signed_at || null,
+      participants: (participants || []).map((p) => {
+        const rec = recordMap.get(p.student_no);
+        return {
+          student_no: p.student_no,
+          student_name: p.student_name,
+          status: rec?.status || 'absent',
+          signed_at: rec?.signed_at || null,
+          makeup_at: rec?.makeup_at || null,
+          makeup_reason: rec?.makeup_reason || null,
+        };
+      }),
+      summary: {
+        total: (participants || []).length,
+        signed: (records || []).filter((r) => r.status === 'signed').length,
+        makeup: (records || []).filter((r) => r.status === 'makeup').length,
+        absent:
+          (participants || []).length -
+          (records || []).filter((r) => r.status === 'signed' || r.status === 'makeup').length,
+      },
     };
   }
 
   async signIn(user: AuthUser, taskId: string) {
     requireStudent(user);
     const client = getSupabaseClient();
-    const { data: task, error } = await client
-      .from('attendance_tasks')
-      .select('id, start_at, end_at, status')
-      .eq('id', taskId)
-      .maybeSingle();
-    if (error || !task) throw new BadRequestException('签到任务不存在');
+    const task = await this.requireStudentTask(client, user.student_no, taskId);
     if (task.status !== 'active') throw new BadRequestException('签到已结束');
     if (new Date(task.end_at).getTime() < Date.now()) throw new BadRequestException('签到已过期，无法签到');
-
-    // 确认学生在本次任务名册中
-    const { data: participant, error: partErr } = await client
-      .from('attendance_participants')
-      .select('id')
-      .eq('task_id', taskId)
-      .eq('student_no', user.student_no || '')
-      .maybeSingle();
-    if (partErr || !participant) throw new BadRequestException('你不在本次签到名单中');
 
     const { data: existing } = await client
       .from('attendance_records')
@@ -268,6 +257,7 @@ export class AttendanceService {
     if (!reason) throw new BadRequestException('请填写补签原因');
 
     const client = getSupabaseClient();
+    await this.requireOwnedTask(client, user.id, taskId);
     const { data: participant, error: pErr } = await client
       .from('attendance_participants')
       .select('id')
@@ -298,11 +288,42 @@ export class AttendanceService {
   }
 
   // ---- 私有工具 ----
+  private async requireOwnedTask(client: ReturnType<typeof getSupabaseClient>, teacherId: string, taskId: string) {
+    const { data, error } = await client
+      .from('attendance_tasks')
+      .select(`${TASK_COLUMNS}, courses!inner(name)`)
+      .eq('id', taskId)
+      .eq('courses.teacher_user_id', teacherId)
+      .maybeSingle();
+    if (error) throw new BadRequestException('查询签到失败');
+    if (!data) throw new NotFoundException('签到任务不存在或无权访问');
+    return data;
+  }
+
+  private studentTasks(client: ReturnType<typeof getSupabaseClient>, studentNo: string) {
+    return client
+      .from('attendance_tasks')
+      .select(`${TASK_COLUMNS}, courses(name), attendance_participants()`)
+      .eq('attendance_participants.student_no', studentNo)
+      .not('attendance_participants', 'is', null);
+  }
+
+  private async requireStudentTask(
+    client: ReturnType<typeof getSupabaseClient>,
+    studentNo: string | null,
+    taskId: string,
+  ) {
+    if (!studentNo) throw new NotFoundException('签到任务不存在或无权访问');
+    const { data, error } = await this.studentTasks(client, studentNo).eq('id', taskId).maybeSingle();
+    if (error) throw new BadRequestException('查询签到失败');
+    if (!data) throw new NotFoundException('签到任务不存在或无权访问');
+    return data;
+  }
+
   private async enrichTasks(
     client: ReturnType<typeof getSupabaseClient>,
     tasks: TaskRow[],
     courseName: Map<string, string>,
-    studentNo: string | null,
   ): Promise<TaskRow[]> {
     if (tasks.length === 0) return [];
 
@@ -322,14 +343,6 @@ export class AttendanceService {
     for (const p of participants || []) {
       totalMap.set(p.task_id, (totalMap.get(p.task_id) || 0) + 1);
     }
-    const recordMap = new Map<string, string>();
-    for (const r of records || []) {
-      recordMap.set(`${r.task_id}::${r.student_no}`, r.status);
-      if (studentNo === null) {
-        // 仅教师视角需要统计数
-      }
-    }
-
     return tasks.map((t) => {
       let signedCount = 0;
       let makeupCount = 0;
@@ -338,7 +351,7 @@ export class AttendanceService {
         if (r.status === 'signed') signedCount++;
         else if (r.status === 'makeup') makeupCount++;
       }
-      const result: TaskRow = {
+      return {
         ...t,
         status: resolveTaskStatus(t.status, t.end_at),
         course_name: courseName.get(t.course_id) || '未知课程',
@@ -346,10 +359,6 @@ export class AttendanceService {
         signed_count: signedCount,
         makeup_count: makeupCount,
       };
-      if (studentNo !== null) {
-        result.my_status = recordMap.get(`${t.id}::${studentNo}`) || 'unsigned';
-      }
-      return result;
     });
   }
 
