@@ -1,4 +1,4 @@
-import { pgTable, serial, varchar, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core"
+import { pgTable, serial, varchar, timestamp, jsonb, index, uniqueIndex, integer, check } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 
 // ================== 系统表（勿删勿改） ==================
@@ -15,16 +15,54 @@ export const users = pgTable(
 		role: varchar("role", { length: 20 }).notNull(), // 'student' | 'teacher'
 		name: varchar("name", { length: 64 }).notNull(),
 		student_no: varchar("student_no", { length: 64 }), // 学生学号，教师为 null
-		teacher_code: varchar("teacher_code", { length: 64 }), // 教师口令，学生为 null
-		token: varchar("token", { length: 64 }), // 会话 token
+		teacher_code: varchar("teacher_code", { length: 64 }), // Legacy column, unused after cutover
+		token: varchar("token", { length: 64 }), // Legacy column, unused after cutover
+		wx_app_id: varchar("wx_app_id", { length: 64 }),
+		wx_open_id: varchar("wx_open_id", { length: 128 }),
+		employee_no: varchar("employee_no", { length: 64 }),
+		activation_hash: varchar("activation_hash", { length: 64 }),
+		activation_expires_at: timestamp("activation_expires_at", { withTimezone: true }),
 		created_at: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 	},
 	(table) => [
 		index("users_token_idx").on(table.token),
 		index("users_role_idx").on(table.role),
 		index("users_student_no_idx").on(table.student_no),
+		uniqueIndex("users_student_identity_uidx").on(table.student_no).where(sql`${table.role} = 'student'`),
+		uniqueIndex("users_wx_identity_uidx").on(table.wx_app_id, table.wx_open_id),
+		uniqueIndex("users_employee_no_uidx").on(table.employee_no),
+		uniqueIndex("users_activation_hash_uidx").on(table.activation_hash),
+		check("users_wx_identity_pair", sql`
+			(${table.wx_app_id} IS NULL AND ${table.wx_open_id} IS NULL)
+			OR (${table.wx_app_id} IS NOT NULL AND ${table.wx_open_id} IS NOT NULL
+				AND ${table.wx_app_id} <> '' AND ${table.wx_open_id} <> '')`),
+		check("users_teacher_activation_fields", sql`
+			((${table.activation_hash} IS NULL AND ${table.activation_expires_at} IS NULL)
+			OR (${table.activation_hash} IS NOT NULL AND ${table.activation_expires_at} IS NOT NULL
+				AND ${table.employee_no} IS NOT NULL AND ${table.wx_open_id} IS NULL
+				AND ${table.activation_hash} ~ '^[0-9a-f]{64}$'))
+			AND (${table.employee_no} IS NULL OR (${table.role} = 'teacher'
+				AND ${table.employee_no} = btrim(${table.employee_no}) AND ${table.employee_no} <> ''))`),
 	]
-);
+).enableRLS();
+
+// The versioned SQL migration also owns RLS grants, the roster trigger and RPC functions.
+export const authSessions = pgTable("auth_sessions", {
+	token_hash: varchar("token_hash", { length: 64 }).primaryKey(),
+	user_id: varchar("user_id", { length: 36 }).references(() => users.id, { onDelete: "restrict" }),
+	wx_app_id: varchar("wx_app_id", { length: 64 }).notNull(),
+	wx_open_id: varchar("wx_open_id", { length: 128 }).notNull(),
+	expires_at: timestamp("expires_at", { withTimezone: true }).notNull(),
+	revoked_at: timestamp("revoked_at", { withTimezone: true }),
+	attempts: integer("attempts").notNull().default(0),
+	attempt_window_at: timestamp("attempt_window_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+	check("auth_sessions_token_hash_check", sql`${table.token_hash} ~ '^[0-9a-f]{64}$'`),
+	check("auth_sessions_attempts_check", sql`${table.attempts} BETWEEN 0 AND 5`),
+	uniqueIndex("auth_sessions_onboarding_uidx").on(table.wx_app_id, table.wx_open_id).where(sql`${table.user_id} IS NULL`),
+	index("auth_sessions_user_id_idx").on(table.user_id),
+	index("auth_sessions_expires_at_idx").on(table.expires_at),
+]).enableRLS();
 
 // ================== 课程 ==================
 export const courses = pgTable(

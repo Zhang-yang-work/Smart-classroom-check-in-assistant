@@ -35,6 +35,7 @@ test('认证和上传只记录元数据，并保留请求参数、返回值和�
   const roster = [{ binding_code: 'roster-secret' }];
   let statusCode = 200;
   const api = loadSource('src/api/index.ts', {
+    '@tarojs/taro': {},
     '@/utils/storage': { getToken: () => 'bearer-secret' },
     '@/network': {
       Network: {
@@ -49,18 +50,21 @@ test('认证和上传只记录元数据，并保留请求参数、返回值和�
       },
     },
   }, { console: { log: (...args) => logs.push(args) } });
-  const credentials = { name: 'name-secret', teacher_code: 'teacher-secret' };
-  assert.equal(await api.teacherLogin(credentials), authResponse);
-  await api.bindStudent({ student_no: '1', name: 'name-secret', binding_code: 'bind-secret' });
+  const credentials = { name: 'name-secret', employee_no: 'teacher-no', activation_code: 'teacher-secret' };
+  assert.equal(await api.activateTeacher('binding-secret', credentials), authResponse);
+  await api.bindStudent('binding-secret', { student_no: '1', name: 'name-secret' });
+  await api.wechatLogin('wechat-secret');
   assert.equal(JSON.stringify(await api.importRosterExcel('course-a', 'file-secret')), JSON.stringify(roster));
   assert.equal(received[0].data, credentials);
-  assert.equal(received[2].filePath, 'file-secret');
-  assert.ok(received.every(({ header }) => header.Authorization === 'Bearer bearer-secret'));
+  assert.equal(received[3].filePath, 'file-secret');
+  assert.equal(received[0].header.Authorization, 'Bearer binding-secret');
+  assert.equal(received[2].header.Authorization, undefined);
+  assert.equal(received[3].header.Authorization, 'Bearer bearer-secret');
   statusCode = 400;
-  await assert.rejects(api.teacherLogin(credentials), /认证失败/);
+  await assert.rejects(api.activateTeacher('binding-secret', credentials), /认证失败/);
   await assert.rejects(api.importRosterExcel('course-a', 'file-secret'), /上传失败/);
   const output = JSON.stringify(logs);
-  assert.match(output, /\/api\/auth\/teacher-login/);
+  assert.match(output, /\/api\/auth\/teacher\/activate/);
   assert.match(output, /"statusCode":400/);
   assert.doesNotMatch(output, /secret|Authorization|Bearer|teacher_code|binding_code/);
 });

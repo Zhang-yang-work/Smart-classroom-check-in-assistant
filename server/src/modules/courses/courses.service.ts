@@ -1,19 +1,8 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { randomBytes } from 'crypto';
 import { promises as fs } from 'fs';
 import * as XLSX from 'xlsx';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AuthUser, requireTeacher } from '@/common/auth';
-
-function randomCode(length = 6): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const bytes = randomBytes(length);
-  let out = '';
-  for (let i = 0; i < length; i++) {
-    out += chars[bytes[i] % chars.length];
-  }
-  return out;
-}
 
 export interface UploadedFileLike {
   originalname?: string;
@@ -154,7 +143,7 @@ export class CoursesService {
   async importRoster(
     user: AuthUser,
     courseId: string,
-    students: Array<{ student_no: string; student_name: string; binding_code?: string }>,
+    students: Array<{ student_no: string; student_name: string }>,
   ) {
     requireTeacher(user);
     if (!Array.isArray(students) || students.length === 0) {
@@ -174,7 +163,6 @@ export class CoursesService {
       .map((s) => ({
         student_no: (s.student_no || '').trim(),
         student_name: (s.student_name || '').trim(),
-        binding_code: (s.binding_code || '').trim() || randomCode(),
       }))
       .filter((s) => s.student_no && s.student_name);
 
@@ -186,8 +174,9 @@ export class CoursesService {
       if (!unique.has(s.student_no)) unique.set(s.student_no, s);
     }
 
-    const rows = Array.from(unique.values()).map((s) => ({ ...s, course_id: courseId }));
-    const { data, error } = await client.from('course_roster').insert(rows).select('student_no, student_name, binding_code');
+    // Match the database's per-student locking by keeping batch lock order deterministic.
+    const rows = Array.from(unique.keys()).sort().map((no) => ({ ...unique.get(no)!, course_id: courseId }));
+    const { data, error } = await client.from('course_roster').insert(rows).select('student_no, student_name');
     if (error) throw new BadRequestException(`导入名单失败: ${error.message}`);
 
     await this.logAction(user.id, 'import_roster', null, null, {
@@ -236,7 +225,7 @@ export class CoursesService {
 
     const { data, error } = await client
       .from('course_roster')
-      .select('id, student_no, student_name, binding_code, linked_user_id')
+      .select('id, student_no, student_name, linked_user_id')
       .eq('course_id', courseId)
       .order('student_no', { ascending: true });
     if (error) throw new BadRequestException(`查询名单失败: ${error.message}`);

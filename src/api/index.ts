@@ -1,5 +1,6 @@
 import { Network } from '@/network';
-import { getToken } from '@/utils/storage';
+import Taro from '@tarojs/taro';
+import { clearSession, getToken } from '@/utils/storage';
 import type {
   User,
   Course,
@@ -15,14 +16,28 @@ interface ApiEnvelope<T = any> {
   data: T;
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+  }
+}
+
+function returnToLogin(status: number | undefined, token: string) {
+  if (status === 401 && token && token === getToken()) {
+    clearSession();
+    void Taro.reLaunch({ url: '/pages/index/index' });
+  }
+}
+
 async function request<T = any>(options: {
   url: string;
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   data?: Record<string, any>;
+  credential?: string;
 }): Promise<T> {
   const { url, method = 'GET', data } = options;
   const header: Record<string, string> = { 'Content-Type': 'application/json' };
-  const token = getToken();
+  const token = options.credential ?? getToken();
   if (token) header.Authorization = `Bearer ${token}`;
 
   const path = url.split(/[?#]/, 1)[0];
@@ -39,32 +54,36 @@ async function request<T = any>(options: {
 
   const body = res?.data as ApiEnvelope<T> | undefined;
   if (!res || res.statusCode >= 400) {
-    throw new Error(body?.msg || '网络请求失败，请稍后重试');
+    if (!url.startsWith('/api/auth/')) returnToLogin(res?.statusCode, token);
+    throw new ApiError(body?.msg || '网络请求失败，请稍后重试', res?.statusCode);
   }
   return (body?.data ?? null) as T;
 }
 
 // ---- 认证 ----
-export function bindStudent(data: {
-  student_no: string;
-  name: string;
-  binding_code: string;
-}): Promise<{ token: string; user: User }> {
-  return request({ url: '/api/auth/bind', method: 'POST', data });
+type LoginSession = { token: string; user: User };
+
+export function wechatLogin(code: string): Promise<LoginSession | { binding_token: string }> {
+  return request({ url: '/api/auth/wechat/login', method: 'POST', data: { code }, credential: '' });
 }
 
-export function studentLogin(data: {
+export function bindStudent(credential: string, data: {
   student_no: string;
   name: string;
-}): Promise<{ token: string; user: User }> {
-  return request({ url: '/api/auth/student-login', method: 'POST', data });
+}): Promise<LoginSession> {
+  return request({ url: '/api/auth/student/bind', method: 'POST', data, credential });
 }
 
-export function teacherLogin(data: {
+export function activateTeacher(credential: string, data: {
+  employee_no: string;
   name: string;
-  teacher_code: string;
-}): Promise<{ token: string; user: User }> {
-  return request({ url: '/api/auth/teacher-login', method: 'POST', data });
+  activation_code: string;
+}): Promise<LoginSession> {
+  return request({ url: '/api/auth/teacher/activate', method: 'POST', data, credential });
+}
+
+export function logoutSession(): Promise<{ revoked: boolean }> {
+  return request({ url: '/api/auth/logout', method: 'POST' });
 }
 
 export function getMe(): Promise<User> {
@@ -117,6 +136,7 @@ export function importRosterExcel(courseId: string, filePath: string): Promise<R
       body = undefined;
     }
     if (!res || res.statusCode >= 400 || !body || body.code !== 0) {
+      returnToLogin(res?.statusCode, token);
       throw new Error(body?.msg || '上传失败，请稍后重试');
     }
     return (body.data ?? null) as RosterItem[];

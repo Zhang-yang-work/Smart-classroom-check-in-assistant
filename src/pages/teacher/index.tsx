@@ -9,7 +9,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Input } from '@/components/ui/input';
 import { LogOut, BookOpen, Sparkles, Plus, Clock } from 'lucide-react-taro';
 import { listCourses, listTeacherTasks, createTask } from '@/api';
-import { getUser, clearSession } from '@/utils/storage';
+import { getUser } from '@/utils/storage';
+import { logout } from '@/utils/logout';
 import { formatDateTime } from '@/utils/format';
 import type { Course, Task } from '@/api/types';
 
@@ -43,11 +44,6 @@ export default function TeacherPage() {
   });
 
   const user = getUser();
-
-  const logout = () => {
-    clearSession();
-    Taro.redirectTo({ url: '/pages/index/index' });
-  };
 
   const openPublish = () => {
     setSelectedCourse('');
