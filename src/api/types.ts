@@ -21,6 +21,13 @@ export interface TeachingGroup {
 export type FinalAttendanceStatus = 'present' | 'late' | 'excused' | 'absent';
 export type AttendanceStatus = FinalAttendanceStatus | 'unsigned';
 export type AttendanceSummary = Record<AttendanceStatus | 'total', number>;
+export type AttendanceMode = 'normal' | 'location' | 'qr';
+export interface AttendanceLocation {
+  latitude: number;
+  longitude: number;
+  accuracy: number;
+  captured_at_ms: number;
+}
 
 export interface RosterItem {
   id: string;
@@ -34,6 +41,8 @@ export interface Task {
   course_id: string;
   course_name?: string;
   mode: string;
+  location_name?: string | null;
+  location_radius_m?: number | null;
   start_at: string;
   end_at: string;
   normal_end_at?: string | null;

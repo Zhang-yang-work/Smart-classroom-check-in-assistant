@@ -37,3 +37,7 @@ export function statusText(status?: string): string {
       return status || '未知';
   }
 }
+
+export function modeText(mode?: string): string {
+  return mode === 'location' ? '位置签到' : mode === 'qr' ? '二维码签到' : '普通签到';
+}

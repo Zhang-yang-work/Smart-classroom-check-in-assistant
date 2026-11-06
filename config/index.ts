@@ -53,6 +53,15 @@ export default defineConfig<'vite'>(async (merge, _env) => {
   const outputRoot = process.env.OUTPUT_ROOT?.trim() || defaultOutputRoot;
   const isH5 = process.env.TARO_ENV === 'h5';
 
+  if (process.env.TARO_ENV === 'weapp') {
+    const appId = process.env.TARO_APP_WEAPP_APPID?.trim();
+    if ((appId || process.env.WEAPP_RELEASE === '1') && !/^wx[0-9a-f]{16}$/i.test(appId ?? '')) {
+      throw new Error('Set TARO_APP_WEAPP_APPID to a valid WeChat Mini Program AppID.');
+    }
+    // Taro uses TARO_APP_ID when generating the output project.config.json.
+    if (appId) process.env.TARO_APP_ID = appId;
+  }
+
   const buildMiniCIPluginConfig = () => {
     const hasWeappConfig = !!process.env.TARO_APP_WEAPP_APPID;
     const hasTTConfig = !!process.env.TARO_APP_TT_EMAIL;

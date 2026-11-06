@@ -62,10 +62,12 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   const oldTask = await scalar("SELECT to_jsonb(t) FROM attendance_tasks t WHERE id='legacy-task'");
   const oldSnapshot = await scalar("SELECT to_jsonb(p) FROM attendance_participants p WHERE task_id='legacy-task'");
   const oldRecord = await scalar("SELECT to_jsonb(r) FROM attendance_records r WHERE id='legacy-record'");
-  for (const migration of ['001-wechat-identity.sql', '002-teaching-groups-attendance.sql']) {
+  for (const migration of ['001-wechat-identity.sql', '002-teaching-groups-attendance.sql', '003-location-qr-attendance.sql']) {
     await query(readFileSync(join(__dirname, '../database/migrations', migration), 'utf8'));
   }
-  assert.deepEqual(await scalar("SELECT to_jsonb(t)-'normal_end_at'-'ended_at'-'group_snapshot' FROM attendance_tasks t WHERE id='legacy-task'"), oldTask);
+  assert.deepEqual(await scalar(`SELECT to_jsonb(t) - ARRAY['normal_end_at','ended_at','group_snapshot',
+    'location_latitude','location_longitude','location_radius_m','location_name']
+    FROM attendance_tasks t WHERE id='legacy-task'`), oldTask);
   assert.deepEqual(await scalar("SELECT to_jsonb(p)-'group_id'-'group_name' FROM attendance_participants p WHERE task_id='legacy-task'"), oldSnapshot);
   assert.deepEqual(await scalar("SELECT to_jsonb(r) FROM attendance_records r WHERE id='legacy-record'"), oldRecord);
   const oldGroup = await scalar("SELECT group_id FROM course_roster WHERE id='legacy-roster'");
@@ -142,5 +144,63 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   const expired = await publish('teacher', [oldGroup], 0);
   await query("UPDATE attendance_tasks SET end_at=now()-interval '1 second' WHERE id=$1", [expired.id]);
   assert.deepEqual(await change('s1', expired.id, 'sign'), { error: 'closed' });
-  assert.equal(await scalar("SELECT has_function_privilege('anon','public.attendance_change(text,text,text,text,text,text)','EXECUTE')"), false);
+  assert.equal(await scalar(`SELECT has_function_privilege('anon',
+    'public.attendance_change(text,text,text,text,text,text,double precision,double precision,double precision,bigint,bigint)','EXECUTE')`), false);
+
+  async function publishMode(mode, options = []) {
+    const params = ['teacher', 'course', [oldGroup, 'g2'], 5, 5, mode, ...options];
+    const args = params.map((_, index) => '$' + (index + 1)).join(',');
+    return (await service.query(`SELECT attendance_publish(${args}) AS result`, params)).rows[0].result;
+  }
+  async function withProof(actor, id, location, expires = null) {
+    const { rows } = await service.query(`SELECT attendance_change(
+      $1,$2,'sign',NULL,NULL,NULL,$3,$4,$5,$6,$7) AS result`,
+      [actor, id, ...(location ?? [null, null, null, null]), expires]);
+    return rows[0].result;
+  }
+
+  assert.deepEqual(await publishMode('location', [91, 121, 100, '测试楼']), { error: 'invalid_location' });
+  const locationTask = await publishMode('location', [31, 121, 50, '测试楼']);
+  assert.equal(locationTask.mode, 'location');
+  assert.equal(locationTask.location_name, '测试楼');
+  assert.ok(!('location_latitude' in locationTask));
+  assert.deepEqual(await change('s1', locationTask.id, 'sign'), { error: 'invalid_location' });
+  assert.deepEqual(await withProof('s4', locationTask.id, [31, 121, 10, Date.now()]), { error: 'not_found' });
+  assert.deepEqual(await withProof('s1', locationTask.id, [31, 121, 80, Date.now()]), { error: 'invalid_location' });
+  assert.deepEqual(await withProof('s1', locationTask.id, [31, 121, 10, Date.now() - 61000]), { error: 'stale_location' });
+  assert.deepEqual(await withProof('s1', locationTask.id, [31.001, 121, 10, Date.now()]), { error: 'out_of_range' });
+  assert.equal((await withProof('s1', locationTask.id, [31.0002, 121, 10, Date.now()])).status, 'present');
+  assert.deepEqual(await withProof('s1', locationTask.id, [31, 121, 10, Date.now()]), { error: 'duplicate' });
+  await query("UPDATE attendance_tasks SET start_at=now()-interval '10 minutes', normal_end_at=now()-interval '1 second' WHERE id=$1", [locationTask.id]);
+  assert.deepEqual(await withProof('s2', locationTask.id, [31.001, 121, 10, Date.now()]), { error: 'out_of_range' });
+  assert.equal((await withProof('s2', locationTask.id, [31, 121, 10, Date.now()])).status, 'late');
+  await change('teacher', locationTask.id, 'end');
+  assert.deepEqual(await withProof('s3', locationTask.id, [31, 121, 10, Date.now()]), { error: 'closed' });
+
+  const qrTask = await publishMode('qr');
+  assert.deepEqual(await change('s1', qrTask.id, 'sign'), { error: 'expired_qr' });
+  assert.deepEqual(await withProof('s1', qrTask.id, null, Date.now() - 1), { error: 'expired_qr' });
+  assert.deepEqual(await withProof('s4', qrTask.id, null, Date.now() + 5000), { error: 'not_found' });
+  assert.deepEqual(await change('foreign-teacher', qrTask.id, 'end'), { error: 'not_found' });
+  const sameCodeExpiry = Date.now() + 5000;
+  const qrConcurrent = await Promise.all([withProof('s1', qrTask.id, null, sameCodeExpiry), withProof('s1', qrTask.id, null, sameCodeExpiry)]);
+  assert.equal(qrConcurrent.filter(record => record.status === 'present').length, 1);
+  assert.equal(qrConcurrent.filter(record => record.error === 'duplicate').length, 1);
+  await query("UPDATE attendance_tasks SET start_at=now()-interval '10 minutes', normal_end_at=now()-interval '1 second' WHERE id=$1", [qrTask.id]);
+  assert.equal((await withProof('s2', qrTask.id, null, sameCodeExpiry)).status, 'late');
+
+  const lock = await admin.connect();
+  try {
+    await lock.query('BEGIN');
+    await lock.query('SELECT id FROM attendance_tasks WHERE id=$1 FOR UPDATE', [qrTask.id]);
+    const expiring = withProof('s3', qrTask.id, null, Date.now() + 100);
+    await lock.query('SELECT pg_sleep(0.2)');
+    await lock.query('COMMIT');
+    assert.deepEqual(await expiring, { error: 'expired_qr' });
+  } finally {
+    await lock.query('ROLLBACK');
+    lock.release();
+  }
+  await query("UPDATE attendance_tasks SET end_at=now()-interval '1 second' WHERE id=$1", [qrTask.id]);
+  assert.deepEqual(await withProof('s3', qrTask.id, null, Date.now() + 5000), { error: 'closed' });
 });

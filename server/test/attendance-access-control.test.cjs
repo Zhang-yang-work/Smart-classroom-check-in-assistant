@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
+const { randomBytes } = require('node:crypto');
 const { registerHooks } = require('node:module');
 const { join } = require('node:path');
 const { afterEach, beforeEach, mock, test } = require('node:test');
@@ -14,8 +15,11 @@ const sourceRoot = join(__dirname, '../src');
 const sourceUrl = pathToFileURL(sourceRoot).href + '/';
 const sourceHooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (specifier.startsWith('@/')) {
-      return { url: pathToFileURL(join(sourceRoot, specifier.slice(2) + '.ts')).href, shortCircuit: true };
+    if (specifier.startsWith('@/') || (specifier.startsWith('./') && context.parentURL?.startsWith(sourceUrl))) {
+      const url = specifier.startsWith('@/')
+        ? pathToFileURL(join(sourceRoot, specifier.slice(2) + '.ts'))
+        : new URL(specifier + '.ts', context.parentURL);
+      return { url: url.href, shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },
@@ -40,6 +44,7 @@ const { AttendanceController } = require('@/modules/attendance/attendance.contro
 const { AgentService } = require('@/modules/agent/agent.service');
 const { AgentController } = require('@/modules/agent/agent.controller');
 const { CoursesService } = require('@/modules/courses/courses.service');
+const { issueQr, validateQr } = require('@/modules/attendance/attendance-proof');
 sourceHooks.deregister();
 
 const teacher = { id: 'teacher-a', role: 'teacher', name: '教师 A', student_no: null };
@@ -116,7 +121,7 @@ function expectQuery(table, filters, data, method = 'GET', body) {
   requests.push({ table, filters, data, method, body });
 }
 
-const columns = 'id,course_id,mode,start_at,normal_end_at,end_at,ended_at,status,created_at';
+const columns = 'id,course_id,mode,start_at,normal_end_at,end_at,ended_at,status,created_at,location_name,location_radius_m';
 const taskIdFilter = { task_id: 'eq.task-a' };
 const notFound = { status: 404, message: '签到任务不存在或无权访问' };
 
@@ -269,6 +274,74 @@ test('Agent 确认无法越权补签，合法补签仍可执行', async () => {
   const allowed = await propose('task-a');
   expectMakeup();
   assert.match((await agent.confirm(teacher, { pending_id: allowed.pending_id })).content, /完成补签/);
+});
+
+test('Agent 发布仍需教师确认且只能发布普通签到', async () => {
+  const proposal = await chat({
+    type: 'confirm', tool: 'create_attendance',
+    arguments: { course_id: 'course-a', duration_minutes: 5, mode: 'qr' },
+  });
+  assert.equal(proposal.type, 'confirm');
+  await assert.rejects(agent.confirm(student, { pending_id: proposal.pending_id }), { status: 403 });
+  expectQuery('rpc/attendance_publish', {}, { ...task, total: 2 }, 'POST',
+    { p_actor: 'teacher-a', p_course: 'course-a', p_normal: 5, p_late: 5, p_groups: null, p_mode: undefined });
+  assert.match((await agent.confirm(teacher, { pending_id: proposal.pending_id })).content, /已发布签到/);
+});
+
+test('二维码只为有权教师签发，签名绑定任务和有效期', async t => {
+  const previous = process.env.ATTENDANCE_QR_SECRET;
+  process.env.ATTENDANCE_QR_SECRET = randomBytes(32).toString('base64url');
+  t.after(() => {
+    if (previous === undefined) delete process.env.ATTENDANCE_QR_SECRET;
+    else process.env.ATTENDANCE_QR_SECRET = previous;
+  });
+  const slot = Math.floor(Date.now() / 10000) * 10000;
+  const { token, expiresAt } = issueQr(task.id, slot + 30000, slot + 1);
+  assert.equal(issueQr(task.id, slot + 30000, slot + 9999).token, token);
+  assert.notEqual(issueQr(task.id, slot + 30000, expiresAt).token, token);
+  assert.equal(validateQr(task.id, token, expiresAt - 1), expiresAt);
+  assert.throws(() => validateQr(task.id, token, expiresAt), /过期/);
+  assert.throws(() => validateQr('other', token, slot), /不属于/);
+  const forged = token.slice(0, -1) + (token.endsWith('a') ? 'b' : 'a');
+  assert.throws(() => validateQr(task.id, forged, slot), /无效/);
+  await assert.rejects(attendance.qr(student, task.id), { status: 403 });
+  const filter = { id: 'eq.task-a', 'courses.teacher_user_id': 'eq.teacher-a' };
+  expectQuery('attendance_tasks', filter, []);
+  await assert.rejects(attendance.qr(teacher, task.id), { status: 404 });
+  expectQuery('attendance_tasks', filter, [{ ...task, mode: 'qr' }]);
+  const image = await attendance.qr(teacher, task.id);
+  assert.ok(image.rows.length >= 21 && image.rows.every(row => row.length === image.rows.length && /^[01]+$/.test(row)));
+  assert.ok(image.refresh_in_ms >= 0 && image.refresh_in_ms <= 10000);
+
+  const current = issueQr(task.id, Date.now() + 60000, Date.now() + 1000);
+  expectQuery('rpc/attendance_change', {}, { status: 'present' }, 'POST',
+    { p_actor: 'student-a', p_task: task.id, p_action: 'sign', p_qr_expires_ms: current.expiresAt });
+  assert.equal((await attendance.signIn(student, task.id, { qr_token: current.token })).status, 'present');
+  await assert.rejects(attendance.signIn(student, 'other', { qr_token: token }), /不属于/);
+});
+
+test('建筑预设由服务端解析，位置签到拒绝非法坐标并传递有效定位', async t => {
+  const previous = process.env.ATTENDANCE_LOCATION_PRESETS;
+  process.env.ATTENDANCE_LOCATION_PRESETS = JSON.stringify([
+    { id: 'library', name: '测试图书馆', latitude: 31, longitude: 121 },
+  ]);
+  t.after(() => {
+    if (previous === undefined) delete process.env.ATTENDANCE_LOCATION_PRESETS;
+    else process.env.ATTENDANCE_LOCATION_PRESETS = previous;
+  });
+  assert.throws(() => attendance.locationPresets(student), { status: 403 });
+  assert.deepEqual(attendance.locationPresets(teacher), [{ id: 'library', name: '测试图书馆' }]);
+  expectQuery('rpc/attendance_publish', {}, { mode: 'location' }, 'POST',
+    { p_actor: 'teacher-a', p_mode: 'location', p_lat: 31, p_lng: 121, p_radius: 100, p_location_name: '测试图书馆' });
+  await attendance.create(teacher, {
+    course_id: 'course-a', group_ids: ['g1'], duration_minutes: 5,
+    mode: 'location', location_preset_id: 'library', location: { latitude: 90, longitude: 0 },
+  });
+  const location = { latitude: 31, longitude: 121, accuracy: 12, captured_at_ms: Date.now() };
+  await assert.rejects(attendance.signIn(student, task.id, { location: { ...location, latitude: 91 } }), /定位无效/);
+  expectQuery('rpc/attendance_change', {}, { status: 'late' }, 'POST',
+    { p_lat: 31, p_lng: 121, p_accuracy: 12, p_captured_ms: location.captured_at_ms });
+  assert.equal((await attendance.signIn(student, task.id, { location })).status, 'late');
 });
 
 test('Agent 名单工具仅查询并返回学号和姓名', async () => {

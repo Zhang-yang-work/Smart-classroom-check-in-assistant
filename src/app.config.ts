@@ -7,6 +7,10 @@ export default defineAppConfig({
     'pages/detail/index',
     'pages/ai/index'
   ],
+  permission: {
+    'scope.userLocation': { desc: '用于位置签到和设置签到中心' }
+  },
+  requiredPrivateInfos: ['getLocation'],
   window: {
     backgroundTextStyle: 'light',
     navigationBarBackgroundColor: '#ffffff',

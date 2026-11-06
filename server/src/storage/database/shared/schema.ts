@@ -1,4 +1,4 @@
-import { pgTable, serial, varchar, timestamp, jsonb, index, uniqueIndex, integer, check, foreignKey, unique } from "drizzle-orm/pg-core"
+import { pgTable, serial, varchar, timestamp, jsonb, index, uniqueIndex, integer, check, foreignKey, unique, doublePrecision } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 
 // ================== 系统表（勿删勿改） ==================
@@ -131,7 +131,11 @@ export const attendanceTasks = pgTable(
 		created_by: varchar("created_by", { length: 36 })
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
-		mode: varchar("mode", { length: 20 }).notNull().default("normal"), // normal | quick
+		mode: varchar("mode", { length: 20 }).notNull().default("normal"), // normal | location | qr | legacy quick
+		location_latitude: doublePrecision("location_latitude"),
+		location_longitude: doublePrecision("location_longitude"),
+		location_radius_m: integer("location_radius_m"),
+		location_name: varchar("location_name", { length: 128 }),
 		start_at: timestamp("start_at", { withTimezone: true }).notNull(),
 		normal_end_at: timestamp("normal_end_at", { withTimezone: true }),
 		end_at: timestamp("end_at", { withTimezone: true }).notNull(),
@@ -145,6 +149,13 @@ export const attendanceTasks = pgTable(
 		index("attendance_tasks_created_by_idx").on(table.created_by),
 		index("attendance_tasks_status_idx").on(table.status),
 		index("attendance_tasks_created_at_idx").on(table.created_at),
+		check("attendance_tasks_location_check", sql`
+			(${table.mode} = 'location' AND ${table.location_latitude} IS NOT NULL AND ${table.location_latitude} BETWEEN -90 AND 90
+				AND ${table.location_longitude} IS NOT NULL AND ${table.location_longitude} BETWEEN -180 AND 180
+				AND ${table.location_radius_m} IS NOT NULL AND ${table.location_radius_m} IN (50,100,200)
+				AND ${table.location_name} IS NOT NULL AND btrim(${table.location_name}) <> '')
+			OR (${table.mode} <> 'location' AND ${table.location_latitude} IS NULL AND ${table.location_longitude} IS NULL
+				AND ${table.location_radius_m} IS NULL AND ${table.location_name} IS NULL)`),
 	]
 );
 

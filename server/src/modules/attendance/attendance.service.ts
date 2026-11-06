@@ -1,8 +1,12 @@
 import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AuthUser, requireTeacher, requireStudent } from '@/common/auth';
+import { issueQr, locationCenter, locationPresets, locationProof, requireQrSecret, validateQr } from './attendance-proof';
 
-const TASK_COLUMNS = 'id, course_id, mode, start_at, normal_end_at, end_at, ended_at, status, created_at';
+const qrCode: { create(value: string): { modules: { size: number; get(row: number, col: number): number } } } =
+  require('qrcode');
+
+const TASK_COLUMNS = 'id, course_id, mode, start_at, normal_end_at, end_at, ended_at, status, created_at, location_name, location_radius_m';
 const FINAL_STATUSES = ['present', 'late', 'excused', 'absent'] as const;
 type FinalStatus = typeof FINAL_STATUSES[number];
 type AttendanceStatus = FinalStatus | 'unsigned';
@@ -33,6 +37,7 @@ const unavailableTask = () => new NotFoundException('签到任务不存在或无
 export class AttendanceService {
   async createTask(user: AuthUser, body: {
     course_id: string; group_ids?: string[]; duration_minutes: number; late_minutes?: number;
+    mode?: string; location?: unknown; location_preset_id?: unknown; radius_m?: number;
   }, allGroups = false) {
     requireTeacher(user);
     const course = typeof body?.course_id === 'string' ? body.course_id.trim() : '';
@@ -48,15 +53,63 @@ export class AttendanceService {
       || groups.some(id => typeof id !== 'string' || !id || id.length > 36))) {
       throw new BadRequestException('请选择一个或多个教学班');
     }
+    const mode = allGroups ? 'normal' : body.mode ?? 'normal';
+    if (mode !== 'normal' && mode !== 'location' && mode !== 'qr') {
+      throw new BadRequestException('请选择有效的签到方式');
+    }
+    let settings = {};
+    if (mode === 'qr') requireQrSecret();
+    if (mode === 'location') {
+      const radius = body.radius_m ?? 100;
+      if (![50, 100, 200].includes(radius)) throw new BadRequestException('请选择有效的签到半径');
+      if (body.location_preset_id !== undefined) {
+        const preset = locationPresets().find(item => item.id === body.location_preset_id);
+        if (!preset) throw new BadRequestException('预设建筑不可用，请重新选择');
+        settings = { p_lat: preset.latitude, p_lng: preset.longitude, p_location_name: preset.name };
+      } else {
+        const center = locationCenter.safeParse(body.location);
+        if (!center.success || center.data.accuracy > radius) {
+          throw new BadRequestException('请重新获取精度足够的教师定位，或选择预设建筑');
+        }
+        settings = { p_lat: center.data.latitude, p_lng: center.data.longitude, p_location_name: '教师选定的位置' };
+      }
+      settings = { ...settings, p_radius: radius };
+    }
     const { data, error } = await getSupabaseClient().rpc('attendance_publish', {
       p_actor: user.id, p_course: course, p_groups: allGroups ? null : [...new Set(groups)],
       p_normal: normal, p_late: late,
+      ...(mode === 'normal' ? {} : { p_mode: mode }),
+      ...settings,
     });
     if (error || !data) throw new ServiceUnavailableException('暂时无法发布签到');
     if (data.error === 'not_found') throw new NotFoundException('课程不存在或无权访问');
     if (data.error === 'empty_roster') throw new BadRequestException('所选教学班暂无学生名单');
+    if (data.error === 'invalid_location') throw new BadRequestException('签到位置或半径无效');
     if (data.error) throw new BadRequestException('请确认所选教学班及签到时间');
     return data;
+  }
+
+  listLocationPresets(user: AuthUser) {
+    requireTeacher(user);
+    return locationPresets().map(({ id, name }) => ({ id, name }));
+  }
+
+  async getQr(user: AuthUser, taskId: string) {
+    requireTeacher(user);
+    const { data: task, error } = await getSupabaseClient().from('attendance_tasks')
+      .select('id, mode, start_at, end_at, ended_at, status, courses!inner(teacher_user_id)')
+      .eq('id', taskId).eq('courses.teacher_user_id', user.id).maybeSingle();
+    if (error) throw new ServiceUnavailableException('暂时无法获取签到二维码');
+    if (!task || task.mode !== 'qr') throw unavailableTask();
+    const now = Date.now();
+    if (taskStatus(task) !== 'active' || now < new Date(task.start_at).getTime()) {
+      throw new BadRequestException('当前不在签到时段');
+    }
+    const { token, expiresAt } = issueQr(task.id, new Date(task.end_at).getTime(), now);
+    const { modules } = qrCode.create(token);
+    const rows = Array.from({ length: modules.size }, (_, row) =>
+      Array.from({ length: modules.size }, (_, col) => modules.get(row, col) ? '1' : '0').join(''));
+    return { rows, refresh_in_ms: Math.max(0, expiresAt - Date.now()) };
   }
 
   async listTasksForTeacher(user: AuthUser) {
@@ -127,7 +180,8 @@ export class AttendanceService {
         addResult(groups.get(groupId)!.summary, result);
         return { ...participant, status: result };
       });
-      return { task: { ...data.task, status }, participants, summary, groups: [...groups.values()] };
+      const { location_latitude, location_longitude, ...task } = data.task;
+      return { task: { ...task, status }, participants, summary, groups: [...groups.values()] };
     }
 
     requireStudent(user);
@@ -147,9 +201,17 @@ export class AttendanceService {
     };
   }
 
-  signIn(user: AuthUser, taskId: string) {
+  signIn(user: AuthUser, taskId: string, body?: { location?: unknown; qr_token?: unknown }) {
     requireStudent(user);
-    return this.change(user.id, taskId, 'sign');
+    let evidence = {};
+    if (body?.location !== undefined) {
+      const location = locationProof.safeParse(body.location);
+      if (!location.success) throw new BadRequestException('定位无效或精度不足，请重新定位');
+      evidence = { p_lat: location.data.latitude, p_lng: location.data.longitude,
+        p_accuracy: location.data.accuracy, p_captured_ms: location.data.captured_at_ms };
+    }
+    if (body?.qr_token !== undefined) evidence = { ...evidence, p_qr_expires_ms: validateQr(taskId, body.qr_token) };
+    return this.change(user.id, taskId, 'sign', null, null, null, evidence);
   }
 
   end(user: AuthUser, taskId: string) {
@@ -173,14 +235,20 @@ export class AttendanceService {
   }
 
   private async change(actor: string, task: string, action: 'sign' | 'end' | 'adjust',
-    student: string | null = null, status: FinalStatus | null = null, reason: string | null = null) {
+    student: string | null = null, status: FinalStatus | null = null, reason: string | null = null,
+    evidence: Record<string, number> = {}) {
     const { data, error } = await getSupabaseClient().rpc('attendance_change', {
       p_actor: actor, p_task: task, p_action: action, p_student: student, p_status: status, p_reason: reason,
+      ...evidence,
     });
     if (error || !data) throw new ServiceUnavailableException('暂时无法更新签到');
     if (data.error === 'not_found') throw unavailableTask();
     if (data.error === 'duplicate') throw new BadRequestException('已有考勤记录，请勿重复签到');
     if (data.error === 'closed') throw new BadRequestException('当前不在签到时段');
+    if (data.error === 'invalid_location') throw new BadRequestException('需要有效且精度足够的定位，请重新定位');
+    if (data.error === 'stale_location') throw new BadRequestException('定位已过期，请检查手机时间并重新定位');
+    if (data.error === 'out_of_range') throw new BadRequestException('当前位置超出签到范围');
+    if (data.error === 'expired_qr') throw new BadRequestException('二维码无效或已过期，请扫描当前二维码');
     if (data.error === 'not_participant') throw new BadRequestException('该学生不在本次签到名单中');
     if (data.error) throw new BadRequestException('请检查考勤调整内容');
     return data;
