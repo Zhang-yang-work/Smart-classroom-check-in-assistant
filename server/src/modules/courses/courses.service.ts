@@ -23,9 +23,9 @@ function parseExcelToStudents(
 ): Array<{ student_no: string; student_name: string }> {
   let workbook: XLSX.WorkBook;
   try {
-    workbook = XLSX.read(buffer, { type: 'buffer' });
-  } catch (e) {
-    throw new BadRequestException(`无法解析 Excel 文件: ${(e as Error).message}`);
+    workbook = XLSX.read(buffer, { type: 'buffer', sheetRows: 1002 });
+  } catch {
+    throw new BadRequestException('无法解析 Excel 文件');
   }
 
   const sheetName = workbook.SheetNames[0];
@@ -35,6 +35,8 @@ function parseExcelToStudents(
   const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
     header: 1,
     defval: '',
+    raw: false,
+    blankrows: false,
   });
   if (!rows || rows.length === 0) throw new BadRequestException('Excel 无数据行');
 
@@ -85,7 +87,8 @@ function parseExcelToStudents(
   for (let i = dataStart; i < rows.length; i++) {
     const no = normalizeCell(rows[i]?.[noCol]);
     const name = String(rows[i]?.[nameCol] ?? '').trim();
-    if (no && name) students.push({ student_no: no, student_name: name });
+    if (!no || !name) throw new BadRequestException(`第 ${i + 1} 条表格记录缺少学号或姓名`);
+    students.push({ student_no: no, student_name: name });
   }
   return students;
 }
@@ -94,8 +97,8 @@ function parseExcelToStudents(
 export class CoursesService {
   async createCourse(user: AuthUser, body: { name: string }) {
     requireTeacher(user);
-    const name = (body.name || '').trim();
-    if (!name) throw new BadRequestException('课程名不能为空');
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (!name || name.length > 128) throw new BadRequestException('请输入有效的课程名');
 
     const client = getSupabaseClient();
     const { data, error } = await client
@@ -114,7 +117,7 @@ export class CoursesService {
     if (user.role === 'teacher') {
       const { data, error } = await client
         .from('courses')
-        .select('id, name, created_at')
+        .select('id, name, created_at, groups:teaching_groups(id,name)')
         .eq('teacher_user_id', user.id)
         .order('created_at', { ascending: false });
       if (error) throw new BadRequestException(`查询课程失败: ${error.message}`);
@@ -124,17 +127,18 @@ export class CoursesService {
     // 学生：通过名单关联的课程
     const { data: rosterRows, error } = await client
       .from('course_roster')
-      .select('course_id, courses(id, name)')
+      .select('course_id, courses(id, name), group:teaching_groups!course_roster_group_fk(id,name)')
+      .eq('student_no', user.student_no ?? '')
       .eq('linked_user_id', user.id);
     if (error) throw new BadRequestException(`查询课程失败: ${error.message}`);
 
     const seen = new Set<string>();
-    const courses: Array<{ id: string; name: string }> = [];
+    const courses: Array<{ id: string; name: string; group: unknown }> = [];
     for (const row of rosterRows || []) {
       const c = row.courses as unknown as { id: string; name: string } | null;
       if (c && !seen.has(c.id)) {
         seen.add(c.id);
-        courses.push(c);
+        courses.push({ ...c, group: row.group });
       }
     }
     return courses;
@@ -143,50 +147,45 @@ export class CoursesService {
   async importRoster(
     user: AuthUser,
     courseId: string,
+    groupId: string,
     students: Array<{ student_no: string; student_name: string }>,
   ) {
     requireTeacher(user);
-    if (!Array.isArray(students) || students.length === 0) {
-      throw new BadRequestException('名单不能为空');
+    if (!Array.isArray(students) || students.length === 0 || students.length > 1000) {
+      throw new BadRequestException('每次导入 1 至 1000 名学生');
     }
 
     const client = getSupabaseClient();
-    const { data: course, error: courseErr } = await client
-      .from('courses')
-      .select('id')
-      .eq('id', courseId)
-      .eq('teacher_user_id', user.id)
-      .maybeSingle();
-    if (courseErr || !course) throw new BadRequestException('课程不存在或无权操作');
+    await this.requireOwnedGroup(user, courseId, groupId);
 
-    const normalized = students
-      .map((s) => ({
-        student_no: (s.student_no || '').trim(),
-        student_name: (s.student_name || '').trim(),
-      }))
-      .filter((s) => s.student_no && s.student_name);
-
-    if (normalized.length === 0) throw new BadRequestException('名单无有效学生信息');
-
-    // 去重（同一学号只保留一条）
-    const unique = new Map<string, (typeof normalized)[number]>();
-    for (const s of normalized) {
-      if (!unique.has(s.student_no)) unique.set(s.student_no, s);
+    const unique = new Map<string, string>();
+    for (const s of students) {
+      const no = typeof s?.student_no === 'string' ? s.student_no.trim() : '';
+      const name = typeof s?.student_name === 'string' ? s.student_name.trim() : '';
+      if (!no || !name || no.length > 64 || name.length > 64) {
+        throw new BadRequestException('名单中的学号和姓名必须为 1 至 64 字符');
+      }
+      if (unique.has(no)) throw new BadRequestException('文件中存在重复学号，请核对后重新导入');
+      unique.set(no, name);
     }
 
     // Match the database's per-student locking by keeping batch lock order deterministic.
-    const rows = Array.from(unique.keys()).sort().map((no) => ({ ...unique.get(no)!, course_id: courseId }));
+    const rows = [...unique.keys()].sort().map(no => ({
+      student_no: no, student_name: unique.get(no)!, course_id: courseId, group_id: groupId,
+    }));
     const { data, error } = await client.from('course_roster').insert(rows).select('student_no, student_name');
-    if (error) throw new BadRequestException(`导入名单失败: ${error.message}`);
+    if (error?.code === '23505') throw new BadRequestException('名单中有学生已归属本课程的教学班，整批未导入');
+    if (error) throw new BadRequestException('导入名单失败，请核对文件内容');
 
     await this.logAction(user.id, 'import_roster', null, null, {
       course_id: courseId,
+      group_id: groupId,
       count: rows.length,
     });
     return data || [];
   }
 
-  async importRosterExcel(user: AuthUser, courseId: string, file: UploadedFileLike) {
+  async importRosterExcel(user: AuthUser, courseId: string, groupId: string, file: UploadedFileLike) {
     requireTeacher(user);
     if (!file) throw new BadRequestException('请选择要上传的 Excel 文件');
 
@@ -209,10 +208,31 @@ export class CoursesService {
       throw new BadRequestException('Excel 中未解析到有效学生（需包含学号、姓名两列）');
     }
 
-    return this.importRoster(user, courseId, students);
+    return this.importRoster(user, courseId, groupId, students);
   }
 
-  async getRoster(user: AuthUser, courseId: string) {
+  async createGroup(user: AuthUser, courseId: string, value: unknown) {
+    const name = typeof value === 'string' ? value.trim() : '';
+    if (!name || name.length > 128) throw new BadRequestException('请输入有效的教学班名称');
+    await this.requireOwnedCourse(user, courseId);
+    const { data, error } = await getSupabaseClient().from('teaching_groups')
+      .insert({ course_id: courseId, name }).select('id, name').single();
+    if (error?.code === '23505') throw new BadRequestException('本课程已有同名教学班');
+    if (error) throw new BadRequestException('创建教学班失败');
+    return data;
+  }
+
+  async getRoster(user: AuthUser, courseId: string, groupId: string) {
+    await this.requireOwnedGroup(user, courseId, groupId);
+    const { data, error } = await getSupabaseClient().from('course_roster')
+      .select('id, student_no, student_name, linked_user_id')
+      .eq('course_id', courseId).eq('group_id', groupId)
+      .order('student_no', { ascending: true });
+    if (error) throw new BadRequestException('查询名单失败');
+    return data || [];
+  }
+
+  private async requireOwnedCourse(user: AuthUser, courseId: string) {
     requireTeacher(user);
     const client = getSupabaseClient();
     const { data: course, error: courseErr } = await client
@@ -222,14 +242,13 @@ export class CoursesService {
       .eq('teacher_user_id', user.id)
       .maybeSingle();
     if (courseErr || !course) throw new BadRequestException('课程不存在或无权操作');
+  }
 
-    const { data, error } = await client
-      .from('course_roster')
-      .select('id, student_no, student_name, linked_user_id')
-      .eq('course_id', courseId)
-      .order('student_no', { ascending: true });
-    if (error) throw new BadRequestException(`查询名单失败: ${error.message}`);
-    return data || [];
+  private async requireOwnedGroup(user: AuthUser, courseId: string, groupId: string) {
+    await this.requireOwnedCourse(user, courseId);
+    const { data, error } = await getSupabaseClient().from('teaching_groups').select('id')
+      .eq('course_id', courseId).eq('id', groupId).maybeSingle();
+    if (error || !data) throw new BadRequestException('教学班不存在或不属于该课程');
   }
 
   private async logAction(

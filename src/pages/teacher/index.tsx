@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import Taro, { useLoad } from '@tarojs/taro';
+import Taro, { useDidShow } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -22,6 +22,9 @@ export default function TeacherPage() {
   const [loading, setLoading] = useState(true);
   const [publishOpen, setPublishOpen] = useState(false);
   const [selectedCourse, setSelectedCourse] = useState('');
+  const [groupIds, setGroupIds] = useState<string[]>([]);
+  const [lateEnabled, setLateEnabled] = useState(true);
+  const [lateMinutes, setLateMinutes] = useState('5');
   const [duration, setDuration] = useState(5);
   const [customDuration, setCustomDuration] = useState('');
   const [publishing, setPublishing] = useState(false);
@@ -39,7 +42,7 @@ export default function TeacherPage() {
     }
   };
 
-  useLoad(() => {
+  useDidShow(() => {
     load();
   });
 
@@ -47,24 +50,29 @@ export default function TeacherPage() {
 
   const openPublish = () => {
     setSelectedCourse('');
+    setGroupIds([]);
+    setLateEnabled(true);
+    setLateMinutes('5');
     setDuration(5);
     setCustomDuration('');
     setPublishOpen(true);
   };
 
   const doPublish = async () => {
-    if (!selectedCourse) {
-      Taro.showToast({ title: '请选择课程', icon: 'none' });
+    if (!selectedCourse || !groupIds.length) {
+      Taro.showToast({ title: '请选择课程和教学班', icon: 'none' });
       return;
     }
-    const minutes = Number(duration || customDuration);
-    if (!minutes || minutes <= 0) {
-      Taro.showToast({ title: '请设置签到时长', icon: 'none' });
+    const minutes = customDuration.trim() ? Number(customDuration) : duration;
+    const late = lateEnabled ? Number(lateMinutes) : 0;
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440
+      || !Number.isInteger(late) || late > 1440 || (lateEnabled && late < 1)) {
+      Taro.showToast({ title: '请输入 1 至 1440 分钟的整数时长', icon: 'none' });
       return;
     }
     setPublishing(true);
     try {
-      await createTask({ course_id: selectedCourse, duration_minutes: minutes });
+      await createTask({ course_id: selectedCourse, group_ids: groupIds, duration_minutes: minutes, late_minutes: late });
       Taro.showToast({ title: '签到已发布', icon: 'success' });
       setPublishOpen(false);
       await load();
@@ -152,15 +160,8 @@ export default function TeacherPage() {
                   </Badge>
                 </View>
                 <Text className="block text-xs text-muted-foreground mt-2">
-                  {formatDateTime(t.start_at)} · 应到 {t.total ?? 0} 人
+                  {formatDateTime(t.start_at)} 发布 · {formatDateTime(t.ended_at || t.end_at)} 截止
                 </Text>
-                <View className="flex items-center gap-3 mt-2">
-                  <Text className="block text-xs">
-                    <Text className="text-green-600">已签 {t.signed_count ?? 0}</Text>
-                    {'  '}
-                    <Text className="text-amber-600">补签 {t.makeup_count ?? 0}</Text>
-                  </Text>
-                </View>
               </CardContent>
             </Card>
           ))}
@@ -171,7 +172,7 @@ export default function TeacherPage() {
       <Dialog open={publishOpen} onOpenChange={setPublishOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>发布签到</DialogTitle>
+            <DialogTitle>发布普通签到</DialogTitle>
           </DialogHeader>
           <View className="flex flex-col gap-4 mt-2">
             <View>
@@ -186,7 +187,7 @@ export default function TeacherPage() {
                     <Button
                       key={c.id}
                       variant={selectedCourse === c.id ? 'default' : 'outline'}
-                      onClick={() => setSelectedCourse(c.id)}
+                      onClick={() => { setSelectedCourse(c.id); setGroupIds([]); }}
                     >
                       {c.name}
                     </Button>
@@ -194,8 +195,25 @@ export default function TeacherPage() {
                 </View>
               )}
             </View>
+            {selectedCourse && (
+              <View className="flex flex-col gap-2">
+                <Text className="block text-sm font-medium">教学班（可多选）</Text>
+                <View className="flex flex-wrap gap-2">
+                  {courses.find(course => course.id === selectedCourse)?.groups?.map(group => (
+                    <Button key={group.id} size="sm" variant={groupIds.includes(group.id) ? 'default' : 'outline'}
+                      onClick={() => setGroupIds(ids => ids.includes(group.id) ? ids.filter(id => id !== group.id) : [...ids, group.id])}
+                    >
+                      {group.name}
+                    </Button>
+                  ))}
+                </View>
+                {!courses.find(course => course.id === selectedCourse)?.groups?.length && (
+                  <Text className="block text-sm text-muted-foreground">请先创建教学班并导入名单</Text>
+                )}
+              </View>
+            )}
             <View>
-              <Text className="block text-sm font-medium text-foreground mb-2">签到时长（分钟）</Text>
+              <Text className="block text-sm font-medium text-foreground mb-2">正常签到时长（分钟）</Text>
               <View className="flex items-center gap-2 mb-2">
                 {DURATIONS.map((d) => (
                   <Button
@@ -217,6 +235,16 @@ export default function TeacherPage() {
                 value={customDuration}
                 onInput={(e) => setCustomDuration((e as any).detail.value)}
               />
+            </View>
+            <View className="flex flex-col gap-2">
+              <Button size="sm" variant="outline" onClick={() => setLateEnabled(value => !value)}>
+                迟到窗口：{lateEnabled ? '开启' : '关闭'}
+              </Button>
+              {lateEnabled && (
+                <Input type="number" placeholder="迟到窗口时长（分钟）" value={lateMinutes}
+                  onInput={event => setLateMinutes(event.detail.value)}
+                />
+              )}
             </View>
           </View>
           <DialogFooter>

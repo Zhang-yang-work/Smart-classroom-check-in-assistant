@@ -17,6 +17,12 @@ export function formatDateTime(iso?: string | null): string {
 
 export function statusText(status?: string): string {
   switch (status) {
+    case 'present':
+      return '正常出勤';
+    case 'late':
+      return '迟到';
+    case 'excused':
+      return '请假';
     case 'signed':
       return '已签到';
     case 'makeup':

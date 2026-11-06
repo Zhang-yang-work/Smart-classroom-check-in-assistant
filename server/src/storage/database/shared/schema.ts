@@ -1,4 +1,4 @@
-import { pgTable, serial, varchar, timestamp, jsonb, index, uniqueIndex, integer, check } from "drizzle-orm/pg-core"
+import { pgTable, serial, varchar, timestamp, jsonb, index, uniqueIndex, integer, check, foreignKey, unique } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 
 // ================== 系统表（勿删勿改） ==================
@@ -81,7 +81,18 @@ export const courses = pgTable(
 	]
 );
 
-// ================== 课程名单（绑定码一次性） ==================
+export const teachingGroups = pgTable("teaching_groups", {
+	id: varchar("id", { length: 36 }).primaryKey().default(sql`gen_random_uuid()`),
+	course_id: varchar("course_id", { length: 36 }).notNull().references(() => courses.id, { onDelete: "cascade" }),
+	name: varchar("name", { length: 128 }).notNull(),
+	created_at: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, table => [
+	unique("teaching_groups_course_id_name_key").on(table.course_id, table.name),
+	unique("teaching_groups_course_id_id_key").on(table.course_id, table.id),
+	check("teaching_groups_name_check", sql`btrim(${table.name}) <> ''`),
+]).enableRLS();
+
+// ================== 教学班名单 ==================
 export const courseRoster = pgTable(
 	"course_roster",
 	{
@@ -91,6 +102,7 @@ export const courseRoster = pgTable(
 			.references(() => courses.id, { onDelete: "cascade" }),
 		student_no: varchar("student_no", { length: 64 }).notNull(),
 		student_name: varchar("student_name", { length: 64 }).notNull(),
+		group_id: varchar("group_id", { length: 36 }).notNull(),
 		binding_code: varchar("binding_code", { length: 32 }), // 一次性绑定码（演示用明文，生产应收敛为哈希）
 		linked_user_id: varchar("linked_user_id", { length: 36 })
 			.references(() => users.id, { onDelete: "set null" }),
@@ -100,6 +112,9 @@ export const courseRoster = pgTable(
 		index("course_roster_course_id_idx").on(table.course_id),
 		index("course_roster_student_no_idx").on(table.student_no),
 		index("course_roster_linked_user_id_idx").on(table.linked_user_id),
+		index("course_roster_group_idx").on(table.group_id),
+		foreignKey({ name: "course_roster_group_fk", columns: [table.course_id, table.group_id],
+			foreignColumns: [teachingGroups.course_id, teachingGroups.id] }),
 		uniqueIndex("course_roster_binding_code_uidx").on(table.binding_code),
 		uniqueIndex("course_roster_unique_course_student").on(table.course_id, table.student_no),
 	]
@@ -118,8 +133,11 @@ export const attendanceTasks = pgTable(
 			.references(() => users.id, { onDelete: "cascade" }),
 		mode: varchar("mode", { length: 20 }).notNull().default("normal"), // normal | quick
 		start_at: timestamp("start_at", { withTimezone: true }).notNull(),
+		normal_end_at: timestamp("normal_end_at", { withTimezone: true }),
 		end_at: timestamp("end_at", { withTimezone: true }).notNull(),
-		status: varchar("status", { length: 20 }).notNull().default("active"), // active | cancelled
+		ended_at: timestamp("ended_at", { withTimezone: true }),
+		group_snapshot: jsonb("group_snapshot").$type<Array<{ id: string; name: string }>>().notNull().default(sql`'[]'::jsonb`),
+		status: varchar("status", { length: 20 }).notNull().default("active"), // active | ended | legacy cancelled
 		created_at: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 	},
 	(table) => [
@@ -140,6 +158,8 @@ export const attendanceParticipants = pgTable(
 			.references(() => attendanceTasks.id, { onDelete: "cascade" }),
 		student_no: varchar("student_no", { length: 64 }).notNull(),
 		student_name: varchar("student_name", { length: 64 }).notNull(),
+		group_id: varchar("group_id", { length: 36 }),
+		group_name: varchar("group_name", { length: 128 }),
 		course_roster_id: varchar("course_roster_id", { length: 36 })
 			.references(() => courseRoster.id, { onDelete: "set null" }),
 		created_at: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -161,7 +181,7 @@ export const attendanceRecords = pgTable(
 			.notNull()
 			.references(() => attendanceTasks.id, { onDelete: "cascade" }),
 		student_no: varchar("student_no", { length: 64 }).notNull(),
-		status: varchar("status", { length: 20 }).notNull().default("signed"), // signed | makeup
+		status: varchar("status", { length: 20 }).notNull().default("signed"), // present | late | excused | absent, plus legacy values
 		signed_at: timestamp("signed_at", { withTimezone: true }),
 		makeup_at: timestamp("makeup_at", { withTimezone: true }),
 		makeup_by: varchar("makeup_by", { length: 36 })

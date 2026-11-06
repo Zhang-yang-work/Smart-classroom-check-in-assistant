@@ -166,8 +166,7 @@ export class AgentService {
         return this.attendanceService.createTask(user, {
           course_id: args?.course_id,
           duration_minutes: Number(args?.duration_minutes) || 5,
-          mode: 'quick',
-        });
+        }, true);
       case 'makeup_attendance':
         return this.attendanceService.makeup(user, args?.task_id, {
           student_no: args?.student_no,
@@ -223,10 +222,14 @@ export class AgentService {
   private async getAbsentees(user: AuthUser, taskId?: string) {
     if (!taskId) throw new Error('缺少任务 task_id');
     const detail: any = await this.attendanceService.getTaskDetail(user, taskId);
-    const absentees = (detail.participants || [])
-      .filter((p: any) => p.status === 'absent')
-      .map((p: any) => ({ student_no: p.student_no, student_name: p.student_name }));
-    return { absentees, summary: detail.summary };
+    const taskStatus = detail.task.status;
+    const absentees: Array<{ student_no: string; student_name: string }> = [];
+    const unsigned: typeof absentees = [];
+    for (const { status, student_no, student_name } of detail.participants ?? []) {
+      if (status === 'absent') absentees.push({ student_no, student_name });
+      if (taskStatus === 'active' && status === 'unsigned') unsigned.push({ student_no, student_name });
+    }
+    return { task_status: taskStatus, unsigned, absentees, summary: detail.summary };
   }
 
   // ---- 上下文与提示词 ----
@@ -255,7 +258,7 @@ export class AgentService {
         : context.tasks
             .map(
               (t: any) =>
-                `- 任务 id=${t.id}｜课程「${t.course_name}」｜应到${t.total}｜已签${t.signed_count}｜补签${t.makeup_count}｜${t.status === 'active' ? '进行中' : '已截止'}｜截止${new Date(t.end_at).toLocaleString('zh-CN')}`,
+                `- 任务 id=${t.id}｜课程「${t.course_name}」｜${t.status === 'active' ? '进行中' : '已截止'}｜截止${new Date(t.ended_at || t.end_at).toLocaleString('zh-CN')}`,
             )
             .join('\n');
 
@@ -278,12 +281,13 @@ export class AgentService {
 - list_recent_tasks：参数 {course_id?}。返回最近签到任务。
 - list_roster：参数 {course_id}。返回课程名单。
 - get_attendance：参数 {task_id}。返回某次签到的统计与每个学生状态。
-- get_absentees：参数 {task_id}。返回缺勤学生名单。
-- create_attendance：参数 {course_id, duration_minutes}。发布签到（写，需确认）。
+- get_absentees：参数 {task_id}。返回任务状态、尚未签到名单（unsigned）和缺勤名单（absentees）。
+- create_attendance：参数 {course_id, duration_minutes}。为课程全部教学班发布签到，正常截止后另有 5 分钟迟到窗口（写，需确认）。
 - makeup_attendance：参数 {task_id, student_no, reason}。补签（写，需确认）。
 
 ## 规则
 - 数据必须来自工具真实返回，禁止编造。
+- 签到进行中，unsigned 表述为「尚未签到」，absentees 表述为「教师已标记缺勤」，两份名单分开说明。任务已结束时，absentees 表述为「最终缺勤」。对 get_attendance 的同类状态也使用这些表述。
 - 发布签到、补签等写操作，必须用 type=confirm 请求老师确认并给出 summary。
 - 读操作用 type=query 执行；拿到结果后可继续 query，最后用 type=reply 总结真实数据。
 - 课程名与 id 的对照见【当前上下文】，找不到再调用 list_courses / list_recent_tasks。
