@@ -15,7 +15,6 @@ export interface RosterItem {
   id: string;
   student_no: string;
   student_name: string;
-  binding_code: string;
   linked_user_id: string | null;
 }
 

@@ -241,12 +241,9 @@ export default function CoursePage() {
                               <Text className="block text-sm text-foreground">
                                 {item.student_name}（{item.student_no}）
                               </Text>
-                              <Text className="block text-xs text-muted-foreground mt-1">
-                                绑定码 {item.binding_code}
-                              </Text>
                             </View>
                             <Badge variant={item.linked_user_id ? 'secondary' : 'outline'}>
-                              {item.linked_user_id ? '已绑定' : '未绑定'}
+                              {item.linked_user_id ? '已关联' : '未关联'}
                             </Badge>
                           </View>
                         ))}

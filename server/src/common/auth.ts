@@ -3,10 +3,12 @@ import {
   ExecutionContext,
   ForbiddenException,
   Injectable,
+  ServiceUnavailableException,
   UnauthorizedException,
   createParamDecorator,
 } from '@nestjs/common';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { createHash } from 'node:crypto';
 
 export interface AuthUser {
   id: string;
@@ -22,28 +24,29 @@ export const CurrentUser = createParamDecorator(
   },
 );
 
-function extractToken(headers: Record<string, any>): string {
-  const raw = headers?.authorization || headers?.Authorization || '';
-  return raw.startsWith('Bearer ') ? raw.slice(7).trim() : '';
+export function readSessionToken(authorization: unknown): string {
+  if (typeof authorization !== 'string') return '';
+  return /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(authorization)?.[1] ?? '';
+}
+
+export function hashCredential(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 @Injectable()
 export class AuthGuard implements CanActivate {
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
     const request = ctx.switchToHttp().getRequest();
-    const token = extractToken(request.headers || {});
+    const token = readSessionToken(request.headers?.authorization);
     if (!token) {
       throw new UnauthorizedException('未登录，请先绑定或登录');
     }
 
     const client = getSupabaseClient();
-    const { data, error } = await client
-      .from('users')
-      .select('id, role, name, student_no')
-      .eq('token', token)
-      .maybeSingle();
+    const { data, error } = await client.rpc('auth_resolve_session', { p_hash: hashCredential(token) });
 
-    if (error || !data) {
+    if (error) throw new ServiceUnavailableException('暂时无法验证登录，请稍后重试');
+    if (!data) {
       throw new UnauthorizedException('登录已失效，请重新登录');
     }
 

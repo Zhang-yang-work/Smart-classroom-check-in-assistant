@@ -1,133 +1,94 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import {
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { randomBytes } from 'node:crypto';
+import { z } from 'zod';
+import { hashCredential } from '@/common/auth';
+import type { AuthUser } from '@/common/auth';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { WechatLogin } from './wechat-login';
+
+const loginBody = z.strictObject({ code: z.string().trim().min(1).max(256) });
+const identityField = z.string().trim().min(1).max(64);
+const studentBody = z.strictObject({ student_no: identityField, name: identityField });
+const teacherBody = z.strictObject({
+  employee_no: identityField,
+  name: identityField,
+  activation_code: z.string().trim().regex(/^[A-Za-z0-9_-]{43}$/),
+});
 
 @Injectable()
 export class AuthService {
-  async bindStudent(body: {
-    student_no: string;
-    name: string;
-    binding_code: string;
-  }) {
-    const studentNo = (body.student_no || '').trim();
-    const name = (body.name || '').trim();
-    const code = (body.binding_code || '').trim();
-    if (!studentNo || !name || !code) {
-      throw new BadRequestException('学号、姓名、绑定码均不能为空');
+  private loginWindowEndsAt = 0;
+  private loginAttempts = 0;
+
+  constructor(private readonly wechat: WechatLogin) {}
+
+  async login(body: unknown) {
+    const input = loginBody.safeParse(body);
+    if (!input.success) throw new BadRequestException('请重新获取微信登录凭证');
+    const now = Date.now();
+    if (now >= this.loginWindowEndsAt) {
+      this.loginWindowEndsAt = now + 60_000;
+      this.loginAttempts = 0;
     }
-
-    const client = getSupabaseClient();
-    const { data: roster, error: rosterErr } = await client
-      .from('course_roster')
-      .select('id, course_id, student_no, student_name, linked_user_id')
-      .eq('binding_code', code)
-      .maybeSingle();
-    if (rosterErr) throw new BadRequestException(`绑定码查询失败: ${rosterErr.message}`);
-    if (!roster) throw new BadRequestException('绑定码无效，请核对后重试');
-    if (roster.linked_user_id) throw new BadRequestException('该绑定码已被使用，请联系老师');
-
-    if (roster.student_no !== studentNo || roster.student_name !== name) {
-      throw new BadRequestException('学号或姓名与名单不一致，请核对后重试');
+    if (++this.loginAttempts > 600) {
+      throw new HttpException('登录请求过多，请稍后再试', HttpStatus.TOO_MANY_REQUESTS);
     }
-
-    // 找到或创建学生账号
-    let userId: string;
-    const { data: existing } = await client
-      .from('users')
-      .select('id')
-      .eq('role', 'student')
-      .eq('student_no', studentNo)
-      .maybeSingle();
-    if (existing) {
-      userId = existing.id;
-    } else {
-      const { data: created, error: createErr } = await client
-        .from('users')
-        .insert({ role: 'student', name, student_no: studentNo })
-        .select('id')
-        .single();
-      if (createErr) throw new BadRequestException(`创建账号失败: ${createErr.message}`);
-      userId = created.id;
-    }
-
-    // 链接同一学号的所有名单项（跨课程）
-    const { error: linkErr } = await client
-      .from('course_roster')
-      .update({ linked_user_id: userId })
-      .eq('student_no', studentNo)
-      .is('linked_user_id', null);
-    if (linkErr) throw new BadRequestException(`绑定失败: ${linkErr.message}`);
-
-    const token = randomUUID();
-    const { error: tokenErr } = await client
-      .from('users')
-      .update({ token })
-      .eq('id', userId);
-    if (tokenErr) throw new BadRequestException(`登录失败: ${tokenErr.message}`);
-
-    return {
-      token,
-      user: { id: userId, role: 'student' as const, name, student_no: studentNo },
-    };
+    const { appId, openId } = await this.wechat.exchange(input.data.code);
+    const token = randomBytes(32).toString('base64url');
+    const { data, error } = await getSupabaseClient().rpc('auth_wechat_session', {
+      p_app: appId, p_open: openId, p_hash: hashCredential(token),
+    });
+    if (error || !data) throw new ServiceUnavailableException('登录暂不可用，请稍后重试');
+    return data.user ? { token, user: data.user as AuthUser } : { binding_token: token };
   }
 
-  async studentLogin(body: { student_no: string; name: string }) {
-    const studentNo = (body.student_no || '').trim();
-    const name = (body.name || '').trim();
-    if (!studentNo || !name) throw new BadRequestException('学号与姓名均不能为空');
-
-    const client = getSupabaseClient();
-    const { data, error } = await client
-      .from('users')
-      .select('id, role, name, student_no')
-      .eq('role', 'student')
-      .eq('student_no', studentNo)
-      .eq('name', name)
-      .maybeSingle();
-    if (error) throw new BadRequestException(`登录失败: ${error.message}`);
-    if (!data) {
-      throw new BadRequestException('未找到已绑定账号，请使用老师发放的绑定码完成首次绑定');
-    }
-
-    const token = randomUUID();
-    const { error: tokenErr } = await client
-      .from('users')
-      .update({ token })
-      .eq('id', data.id);
-    if (tokenErr) throw new BadRequestException(`登录失败: ${tokenErr.message}`);
-
-    return {
-      token,
-      user: { id: data.id, role: 'student' as const, name: data.name, student_no: data.student_no },
-    };
+  bindStudent(ticket: string, body: unknown) {
+    const input = studentBody.safeParse(body);
+    if (!input.success) throw new BadRequestException('请填写有效的学号与姓名');
+    return this.bind(ticket, 'student', input.data.student_no, input.data.name, null);
   }
 
-  async teacherLogin(body: { name: string; teacher_code: string }) {
-    const name = (body.name || '').trim();
-    const code = (body.teacher_code || '').trim();
-    if (!name || !code) throw new BadRequestException('姓名与教师口令均不能为空');
+  activateTeacher(ticket: string, body: unknown) {
+    const input = teacherBody.safeParse(body);
+    if (!input.success) throw new BadRequestException('请填写有效的工号、姓名与激活码');
+    return this.bind(ticket, 'teacher', input.data.employee_no, input.data.name,
+      hashCredential(input.data.activation_code));
+  }
 
-    const client = getSupabaseClient();
-    const { data, error } = await client
-      .from('users')
-      .select('id, role, name')
-      .eq('role', 'teacher')
-      .eq('teacher_code', code)
-      .eq('name', name)
-      .maybeSingle();
-    if (error) throw new BadRequestException(`登录失败: ${error.message}`);
-    if (!data) throw new BadRequestException('教师口令或姓名不正确');
+  private async bind(ticket: string, role: AuthUser['role'], number: string, name: string, activation: string | null) {
+    if (!ticket) throw new UnauthorizedException('绑定凭证已失效，请重新微信登录');
+    const token = randomBytes(32).toString('base64url');
+    const { data, error } = await getSupabaseClient().rpc('auth_bind_wechat', {
+      p_ticket: hashCredential(ticket), p_hash: hashCredential(token), p_role: role,
+      p_number: number, p_name: name, p_activation: activation,
+    });
+    if (error?.code === '23505') throw new ConflictException('身份绑定发生冲突，请重新登录');
+    if (error || !data) throw new ServiceUnavailableException('绑定暂不可用，请重新登录确认');
+    switch (data.error) {
+      case 'expired': throw new UnauthorizedException('绑定凭证已失效，请重新微信登录');
+      case 'limited': throw new HttpException('尝试次数过多，请稍后再试', HttpStatus.TOO_MANY_REQUESTS);
+      case 'conflict': throw new ConflictException('身份已绑定，请联系老师或管理员');
+      case 'mismatch': throw new BadRequestException(role === 'teacher'
+        ? '教师预登记或激活码不匹配，请联系管理员'
+        : '学号或姓名与名单不一致，请联系老师核对');
+    }
+    if (!data.user) throw new ServiceUnavailableException('绑定暂不可用，请重新登录确认');
+    return { token, user: data.user as AuthUser };
+  }
 
-    const token = randomUUID();
-    const { error: tokenErr } = await client
-      .from('users')
-      .update({ token })
-      .eq('id', data.id);
-    if (tokenErr) throw new BadRequestException(`登录失败: ${tokenErr.message}`);
-
-    return {
-      token,
-      user: { id: data.id, role: 'teacher' as const, name: data.name, student_no: null },
-    };
+  async logout(token: string) {
+    if (token) {
+      const { error } = await getSupabaseClient().rpc('auth_logout', { p_hash: hashCredential(token) });
+      if (error) throw new ServiceUnavailableException('暂时无法确认服务端退出');
+    }
+    return { revoked: true };
   }
 }

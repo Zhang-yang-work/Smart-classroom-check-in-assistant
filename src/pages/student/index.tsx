@@ -8,7 +8,8 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Separator } from '@/components/ui/separator';
 import { LogOut } from 'lucide-react-taro';
 import { listStudentTasks, signIn } from '@/api';
-import { getUser, clearSession } from '@/utils/storage';
+import { getUser } from '@/utils/storage';
+import { logout } from '@/utils/logout';
 import { formatDateTime, statusText } from '@/utils/format';
 import type { Task } from '@/api/types';
 
@@ -56,11 +57,6 @@ export default function StudentPage() {
     } finally {
       setSigningId('');
     }
-  };
-
-  const logout = () => {
-    clearSession();
-    Taro.redirectTo({ url: '/pages/index/index' });
   };
 
   return (
