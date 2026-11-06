@@ -27,27 +27,34 @@ export class CoursesController {
     return this.coursesService.listCourses(user);
   }
 
-  @Post(':id/roster/import')
+  @Post(':id/groups')
+  createGroup(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: any) {
+    return this.coursesService.createGroup(user, id, body?.name);
+  }
+
+  @Post(':id/groups/:groupId/roster/import')
   async importRoster(
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
+    @Param('groupId') groupId: string,
     @Body() body: any,
   ) {
-    return this.coursesService.importRoster(user, id, body.students || []);
+    return this.coursesService.importRoster(user, id, groupId, body?.students);
   }
 
-  @Post(':id/roster/import-excel')
-  @UseInterceptors(FileInterceptor('file'))
+  @Post(':id/groups/:groupId/roster/import-excel')
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
   async importExcel(
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
+    @Param('groupId') groupId: string,
     @UploadedFile() file: UploadedFileLike,
   ) {
-    return this.coursesService.importRosterExcel(user, id, file);
+    return this.coursesService.importRosterExcel(user, id, groupId, file);
   }
 
-  @Get(':id/roster')
-  async getRoster(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.coursesService.getRoster(user, id);
+  @Get(':id/groups/:groupId/roster')
+  async getRoster(@CurrentUser() user: AuthUser, @Param('id') id: string, @Param('groupId') groupId: string) {
+    return this.coursesService.getRoster(user, id, groupId);
   }
 }

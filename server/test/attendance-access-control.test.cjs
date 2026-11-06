@@ -7,6 +7,7 @@ const { fileURLToPath, pathToFileURL } = require('node:url');
 const ts = require('typescript');
 const { createClient } = require('@supabase/supabase-js');
 const { LLMClient } = require('coze-coding-dev-sdk');
+const XLSX = require('xlsx');
 
 // Load the Nest source with its TypeScript decorators and path alias, without bootstrapping AppModule.
 const sourceRoot = join(__dirname, '../src');
@@ -38,6 +39,7 @@ const { AttendanceService } = require('@/modules/attendance/attendance.service')
 const { AttendanceController } = require('@/modules/attendance/attendance.controller');
 const { AgentService } = require('@/modules/agent/agent.service');
 const { AgentController } = require('@/modules/agent/agent.controller');
+const { CoursesService } = require('@/modules/courses/courses.service');
 sourceHooks.deregister();
 
 const teacher = { id: 'teacher-a', role: 'teacher', name: '教师 A', student_no: null };
@@ -83,7 +85,8 @@ beforeEach(() => {
           }
           if (request.body) {
             const body = JSON.parse(init.body);
-            for (const [key, value] of Object.entries(request.body)) assert.equal(body[key], value);
+            if (Array.isArray(request.body)) assert.deepEqual(body, request.body);
+            else for (const [key, value] of Object.entries(request.body)) assert.equal(body[key], value);
           }
           return Response.json(request.data);
         } catch (error) {
@@ -113,58 +116,50 @@ function expectQuery(table, filters, data, method = 'GET', body) {
   requests.push({ table, filters, data, method, body });
 }
 
-const columns = 'id,course_id,mode,start_at,end_at,status,created_at';
+const columns = 'id,course_id,mode,start_at,normal_end_at,end_at,ended_at,status,created_at';
 const taskIdFilter = { task_id: 'eq.task-a' };
 const notFound = { status: 404, message: '签到任务不存在或无权访问' };
 
 function expectTeacherTask(id, result) {
-  expectQuery('attendance_tasks', {
-    id: `eq.${id}`,
-    select: `${columns},courses!inner(name)`,
-    'courses.teacher_user_id': 'eq.teacher-a',
-  }, result);
+  expectQuery('rpc/attendance_report', {}, result, 'POST', { p_actor: 'teacher-a', p_task: id });
 }
 
 function expectStudentTasks(filters, result) {
   expectQuery('attendance_tasks', {
-    select: `${columns},courses(name),attendance_participants()`,
+    select: `${columns},courses(name),attendance_participants(group_name)`,
     'attendance_participants.student_no': 'eq.001',
     attendance_participants: 'not.is.null',
     ...filters,
-  }, result);
+  }, result.map(taskRow => ({ ...taskRow, attendance_participants: [{ group_name: null }] })));
 }
 
-function expectTeacherDetail() {
-  expectTeacherTask('task-a', [task]);
-  expectQuery('attendance_participants', taskIdFilter, [participant, otherParticipant]);
-  expectQuery('attendance_records', taskIdFilter, [
-    { student_no: '001', status: 'signed', signed_at: signedAt },
-  ]);
+function expectTeacherDetail(ended = false) {
+  expectTeacherTask('task-a', {
+    task: ended ? { ...task, status: 'ended' } : task,
+    participants: [{ ...participant, status: 'signed', signed_at: signedAt }, otherParticipant],
+  });
 }
 
-function expectMakeup() {
-  expectTeacherTask('task-a', [task]);
-  expectQuery('attendance_participants', { ...taskIdFilter, student_no: 'eq.002' }, [{ id: 'p2' }]);
-  expectQuery('attendance_records', { on_conflict: 'task_id,student_no' }, { id: 'm1', status: 'makeup' }, 'POST',
-    { task_id: 'task-a', student_no: '002', makeup_by: 'teacher-a', makeup_reason: '补签' });
-  expectQuery('operation_logs', {}, null, 'POST', { action: 'makeup', task_id: 'task-a' });
+function expectMakeup(id = 'task-a', result = { id: 'm1', status: 'present' }) {
+  expectQuery('rpc/attendance_change', {}, result, 'POST',
+    { p_actor: 'teacher-a', p_task: id, p_action: 'adjust', p_student: '002', p_status: 'present', p_reason: '补签' });
 }
 
 test('教师可查询本人任务及考勤统计', async () => {
   expectTeacherDetail();
   const detail = await attendance.detail(teacher, 'task-a');
-  assert.deepEqual(detail.summary, { total: 2, signed: 1, makeup: 0, absent: 1 });
+  assert.deepEqual(detail.summary, { total: 2, present: 1, late: 0, excused: 0, absent: 0, unsigned: 1 });
   assert.deepEqual(detail.participants.map(({ student_no, status }) => [student_no, status]), [
-    ['001', 'signed'], ['002', 'absent'],
+    ['001', 'present'], ['002', 'unsigned'],
   ]);
 });
 
 test('教师跨课程详情与补签返回统一 404，且不继续读取或写入', async () => {
-  expectTeacherTask('task-b', []);
+  expectTeacherTask('task-b', null);
   await assert.rejects(attendance.detail(teacher, 'task-b'), notFound);
-  expectTeacherTask('missing-task', []);
+  expectTeacherTask('missing-task', null);
   await assert.rejects(attendance.detail(teacher, 'missing-task'), notFound);
-  expectTeacherTask('task-b', []);
+  expectMakeup('task-b', { error: 'not_found' });
   await assert.rejects(attendance.makeup(teacher, 'task-b', { student_no: '002', reason: '补签' }), notFound);
 });
 
@@ -173,13 +168,16 @@ test('学生详情仅查询本人记录，不包含名单或全班统计', async
   expectQuery('attendance_records', { ...taskIdFilter, student_no: 'eq.001', select: 'status,signed_at' }, [
     { status: 'signed', signed_at: signedAt },
   ]);
-  assert.deepEqual(await attendance.detail(student, 'task-a'), { task, my_status: 'signed', signed_at: signedAt });
+  assert.deepEqual(await attendance.detail(student, 'task-a'), {
+    task: { ...task, group_name: null }, my_status: 'present', signed_at: signedAt,
+  });
 });
 
 test('学生无法读取或签到未参与的任务，即使拥有任务 ID', async () => {
   expectStudentTasks({ id: 'eq.task-b' }, []);
   await assert.rejects(attendance.detail(student, 'task-b'), notFound);
-  expectStudentTasks({ id: 'eq.task-b' }, []);
+  expectQuery('rpc/attendance_change', {}, { error: 'not_found' }, 'POST',
+    { p_actor: 'student-a', p_task: 'task-b', p_action: 'sign', p_student: null });
   await assert.rejects(attendance.signIn(student, 'task-b'), notFound);
   await assert.rejects(attendance.detail({ ...student, student_no: null }, 'task-a'), notFound);
 });
@@ -192,21 +190,18 @@ test('学生列表根据快照保留历史，且只查询本人的考勤', async
   ]);
   const { ongoing, history } = await attendance.listForStudent(student);
   assert.deepEqual(ongoing.map(({ id, my_status }) => [id, my_status]), [['task-a', 'unsigned']]);
-  assert.deepEqual(history.map(({ id, my_status }) => [id, my_status]), [['old-task', 'makeup']]);
+  assert.deepEqual(history.map(({ id, my_status }) => [id, my_status]), [['old-task', 'present']]);
   assert.equal(ongoing[0].course_name, '课程 A');
   assert.ok(!('total' in ongoing[0]));
 });
 
 test('合法签到和补签仍写入对应考勤及操作日志', async () => {
-  expectStudentTasks({ id: 'eq.task-a' }, [task]);
-  expectQuery('attendance_records', { ...taskIdFilter, student_no: 'eq.001' }, []);
-  expectQuery('attendance_records', {}, { id: 'r1', status: 'signed' }, 'POST',
-    { task_id: 'task-a', student_no: '001', status: 'signed' });
-  expectQuery('operation_logs', {}, null, 'POST', { action: 'sign_in', task_id: 'task-a' });
-  assert.equal((await attendance.signIn(student, 'task-a')).status, 'signed');
+  expectQuery('rpc/attendance_change', {}, { id: 'r1', status: 'present' }, 'POST',
+    { p_actor: 'student-a', p_task: 'task-a', p_action: 'sign', p_student: null });
+  assert.equal((await attendance.signIn(student, 'task-a')).status, 'present');
 
   expectMakeup();
-  assert.equal((await attendance.makeup(teacher, 'task-a', { student_no: '002', reason: '补签' })).status, 'makeup');
+  assert.equal((await attendance.makeup(teacher, 'task-a', { student_no: '002', reason: '补签' })).status, 'present');
 });
 
 async function chat(proposal) {
@@ -228,13 +223,13 @@ function toolResult(tool) {
 test('Agent 详情和缺勤工具继承权限，合法查询仍返回业务结果', async () => {
   for (const tool of ['get_attendance', 'get_absentees']) {
     const response = chat({ type: 'query', tool, arguments: { task_id: 'task-b' } });
-    expectTeacherTask('task-b', []);
+    expectTeacherTask('task-b', null);
     await response;
     assert.deepEqual(toolResult(tool), { error: notFound.message });
     model.mock.resetCalls();
   }
   const response = chat({ type: 'query', tool: 'get_absentees', arguments: { task_id: 'task-a' } });
-  expectTeacherDetail();
+  expectTeacherDetail(true);
   await response;
   assert.deepEqual(toolResult('get_absentees').absentees, [otherParticipant]);
 });
@@ -244,7 +239,7 @@ test('Agent 确认无法越权补签，合法补签仍可执行', async () => {
     type: 'confirm', tool: 'makeup_attendance', arguments: { task_id: id, student_no: '002', reason: '补签' },
   });
   const forbidden = await propose('task-b');
-  expectTeacherTask('task-b', []);
+  expectMakeup('task-b', { error: 'not_found' });
   await assert.rejects(agent.confirm(teacher, { pending_id: forbidden.pending_id }), notFound);
 
   const allowed = await propose('task-a');
@@ -258,4 +253,38 @@ test('Agent 名单工具仅查询并返回学号和姓名', async () => {
   expectQuery('course_roster', { course_id: 'eq.course-a', select: 'student_no,student_name' }, [participant]);
   await response;
   assert.deepEqual(toolResult('list_roster'), [participant]);
+});
+
+test('结束后的整体和分班统计包含正常、迟到、请假、缺勤及空班', async () => {
+  expectTeacherTask('task-a', {
+    task: { ...task, status: 'ended', group_snapshot: [
+      { id: 'g1', name: '合班一' }, { id: 'g2', name: '合班二' }, { id: 'g3', name: '空班' },
+    ] },
+    participants: [
+      { group_id: 'g1', status: 'present' }, { group_id: 'g1', status: 'late' },
+      { group_id: 'g2', status: 'excused' }, { group_id: 'g2', status: null },
+    ],
+  });
+  const detail = await attendance.detail(teacher, 'task-a');
+  assert.deepEqual(detail.summary, { total: 4, present: 1, late: 1, excused: 1, absent: 1, unsigned: 0 });
+  assert.deepEqual(detail.groups.map(group => [group.name, group.summary.total, group.summary.late, group.summary.absent]), [
+    ['合班一', 2, 1, 0], ['合班二', 2, 0, 1], ['空班', 0, 0, 0],
+  ]);
+});
+
+test('Excel 导入到指定教学班，保留文本学号与格式化前导零，允许跨行政班', async () => {
+  const book = XLSX.utils.book_new();
+  const sheet = XLSX.utils.aoa_to_sheet([
+    ['学号', '姓名', '行政班'], [7, '同学七', '行政一班'], ['008', '同学八', '行政二班'],
+  ]);
+  sheet.A2.z = '000';
+  XLSX.utils.book_append_sheet(book, sheet, '名单');
+  const file = { originalname: '名单.xlsx', buffer: XLSX.write(book, { type: 'buffer', bookType: 'xlsx' }) };
+  const rows = [{ student_no: '007', student_name: '同学七' }, { student_no: '008', student_name: '同学八' }];
+  expectQuery('courses', { id: 'eq.course-a', teacher_user_id: 'eq.teacher-a' }, [{ id: 'course-a' }]);
+  expectQuery('teaching_groups', { id: 'eq.g1', course_id: 'eq.course-a' }, [{ id: 'g1' }]);
+  expectQuery('course_roster', {}, rows, 'POST', rows.map(row => ({ ...row, course_id: 'course-a', group_id: 'g1' })));
+  expectQuery('operation_logs', {}, null, 'POST', { action: 'import_roster' });
+  assert.deepEqual(await new CoursesService().importRosterExcel(teacher, 'course-a', 'g1', file), rows);
+  await assert.rejects(new CoursesService().importRosterExcel(student, 'course-a', 'g1', file), { status: 403 });
 });

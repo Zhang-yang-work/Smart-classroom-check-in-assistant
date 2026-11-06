@@ -8,6 +8,8 @@ import type {
   Task,
   TaskDetail,
   AgentChatResponse,
+  TeachingGroup,
+  FinalAttendanceStatus,
 } from './types';
 
 interface ApiEnvelope<T = any> {
@@ -99,28 +101,33 @@ export function createCourse(name: string): Promise<Course> {
   return request({ url: '/api/courses', method: 'POST', data: { name } });
 }
 
+export function createGroup(courseId: string, name: string): Promise<TeachingGroup> {
+  return request({ url: `/api/courses/${courseId}/groups`, method: 'POST', data: { name } });
+}
+
 export function importRoster(
   courseId: string,
+  groupId: string,
   students: Array<{ student_no: string; student_name: string }>,
 ): Promise<RosterItem[]> {
   return request({
-    url: `/api/courses/${courseId}/roster/import`,
+    url: `/api/courses/${courseId}/groups/${groupId}/roster/import`,
     method: 'POST',
     data: { students },
   });
 }
 
-export function getRoster(courseId: string): Promise<RosterItem[]> {
-  return request({ url: `/api/courses/${courseId}/roster` });
+export function getRoster(courseId: string, groupId: string): Promise<RosterItem[]> {
+  return request({ url: `/api/courses/${courseId}/groups/${groupId}/roster` });
 }
 
-export function importRosterExcel(courseId: string, filePath: string): Promise<RosterItem[]> {
+export function importRosterExcel(courseId: string, groupId: string, filePath: string): Promise<RosterItem[]> {
   const header: Record<string, string> = {};
   const token = getToken();
   if (token) header.Authorization = `Bearer ${token}`;
 
-  const url = `/api/courses/${courseId}/roster/import-excel`;
-  console.log('[API UPLOAD]', { method: 'POST', path: '/api/courses/:courseId/roster/import-excel' });
+  const url = `/api/courses/${courseId}/groups/${groupId}/roster/import-excel`;
+  console.log('[API UPLOAD]', { method: 'POST', path: '/api/courses/:courseId/groups/:groupId/roster/import-excel' });
 
   return (Network.uploadFile({
     url,
@@ -146,7 +153,9 @@ export function importRosterExcel(courseId: string, filePath: string): Promise<R
 // ---- 签到 ----
 export function createTask(data: {
   course_id: string;
+  group_ids: string[];
   duration_minutes: number;
+  late_minutes: number;
 }): Promise<Task> {
   return request({ url: '/api/attendance', method: 'POST', data });
 }
@@ -167,11 +176,15 @@ export function signIn(taskId: string): Promise<{ id: string; status: string; si
   return request({ url: `/api/attendance/${taskId}/sign`, method: 'POST' });
 }
 
-export function makeup(
+export function endTask(taskId: string) {
+  return request({ url: `/api/attendance/${taskId}/end`, method: 'POST' });
+}
+
+export function adjustAttendance(
   taskId: string,
-  data: { student_no: string; reason: string },
+  data: { student_no: string; reason: string; status: FinalAttendanceStatus },
 ): Promise<{ id: string; status: string; makeup_at: string }> {
-  return request({ url: `/api/attendance/${taskId}/makeup`, method: 'POST', data });
+  return request({ url: `/api/attendance/${taskId}/adjust`, method: 'POST', data });
 }
 
 // ---- AI 助手 ----

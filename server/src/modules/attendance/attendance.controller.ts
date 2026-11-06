@@ -36,6 +36,16 @@ export class AttendanceController {
     return this.attendanceService.signIn(user, id);
   }
 
+  @Post(':id/end')
+  end(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.attendanceService.end(user, id);
+  }
+
+  @Post(':id/adjust')
+  adjust(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: any) {
+    return this.attendanceService.adjust(user, id, body);
+  }
+
   // 教师：补签
   @Post(':id/makeup')
   async makeup(

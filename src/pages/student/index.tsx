@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import Taro, { useLoad } from '@tarojs/taro';
+import Taro, { useDidShow } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -7,11 +7,11 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Separator } from '@/components/ui/separator';
 import { LogOut } from 'lucide-react-taro';
-import { listStudentTasks, signIn } from '@/api';
+import { listCourses, listStudentTasks, signIn } from '@/api';
 import { getUser } from '@/utils/storage';
 import { logout } from '@/utils/logout';
 import { formatDateTime, statusText } from '@/utils/format';
-import type { Task } from '@/api/types';
+import type { Course, Task } from '@/api/types';
 
 function countdownLeft(endAt: string): string {
   const ms = new Date(endAt).getTime() - Date.now();
@@ -23,6 +23,7 @@ function countdownLeft(endAt: string): string {
 
 export default function StudentPage() {
   const [ongoing, setOngoing] = useState<Task[]>([]);
+  const [courses, setCourses] = useState<Course[]>([]);
   const [history, setHistory] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [signingId, setSigningId] = useState('');
@@ -30,7 +31,8 @@ export default function StudentPage() {
   const load = async () => {
     setLoading(true);
     try {
-      const res = await listStudentTasks();
+      const [res, memberships] = await Promise.all([listStudentTasks(), listCourses()]);
+      setCourses(memberships);
       setOngoing(res.ongoing || []);
       setHistory(res.history || []);
     } catch (e) {
@@ -40,7 +42,7 @@ export default function StudentPage() {
     }
   };
 
-  useLoad(() => {
+  useDidShow(() => {
     load();
   });
 
@@ -49,11 +51,12 @@ export default function StudentPage() {
   const doSign = async (taskId: string) => {
     setSigningId(taskId);
     try {
-      await signIn(taskId);
-      Taro.showToast({ title: '签到成功', icon: 'success' });
+      const record = await signIn(taskId);
+      Taro.showToast({ title: statusText(record.status), icon: 'success' });
       await load();
     } catch (e) {
       Taro.showToast({ title: (e as Error).message, icon: 'none' });
+      await load();
     } finally {
       setSigningId('');
     }
@@ -85,7 +88,18 @@ export default function StudentPage() {
         </View>
       ) : (
         <>
-          <Text className="block text-sm font-semibold text-foreground mb-3">进行中的签到</Text>
+          {courses.length > 0 && (
+            <Card className="mb-4"><CardContent className="p-4">
+              <Text className="block text-sm font-semibold">我的教学班</Text>
+              {courses.map(course => (
+                <Text key={course.id} className="block text-sm mt-1">{course.name} · {course.group?.name || '未分班'}</Text>
+              ))}
+            </CardContent></Card>
+          )}
+          <View className="flex items-center justify-between mb-3">
+            <Text className="block text-sm font-semibold">进行中的签到</Text>
+            <Button variant="outline" size="sm" onClick={load}>刷新</Button>
+          </View>
           {ongoing.length === 0 ? (
             <Card>
               <CardContent className="p-6">
@@ -102,14 +116,18 @@ export default function StudentPage() {
                     <View className="flex items-start justify-between">
                       <View className="flex-1">
                         <Text className="block text-base font-semibold text-foreground">
-                          {t.course_name}
+                          {t.course_name}{t.group_name ? ` · ${t.group_name}` : ''}
                         </Text>
                         <Text className="block text-xs text-muted-foreground mt-1">
                           {formatDateTime(t.start_at)} 发布 · {countdownLeft(t.end_at)}
                         </Text>
+                        <Text className="block text-xs text-muted-foreground">
+                          正常截止 {formatDateTime(t.normal_end_at || t.end_at)}
+                          {t.normal_end_at && t.normal_end_at !== t.end_at ? ` · 迟到截止 ${formatDateTime(t.end_at)}` : ''}
+                        </Text>
                       </View>
-                      {t.my_status === 'signed' ? (
-                        <Badge>已签到</Badge>
+                      {t.my_status !== 'unsigned' ? (
+                        <Badge>{statusText(t.my_status)}</Badge>
                       ) : (
                         <Button
                           size="sm"
@@ -145,13 +163,13 @@ export default function StudentPage() {
                     <View className="flex items-center justify-between">
                       <View className="flex-1">
                         <Text className="block text-base font-semibold text-foreground">
-                          {t.course_name}
+                          {t.course_name}{t.group_name ? ` · ${t.group_name}` : ''}
                         </Text>
                         <Text className="block text-xs text-muted-foreground mt-1">
                           {formatDateTime(t.start_at)}
                         </Text>
                       </View>
-                      <Badge variant={t.my_status === 'unsigned' ? 'destructive' : 'secondary'}>
+                      <Badge variant={t.my_status === 'absent' ? 'destructive' : 'secondary'}>
                         {statusText(t.my_status)}
                       </Badge>
                     </View>
