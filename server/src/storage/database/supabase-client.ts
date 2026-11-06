@@ -1,6 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { execSync } from 'child_process';
-import { getReportBuffer, createWrappedFetch } from 'coze-coding-dev-sdk';
 
 let envLoaded = false;
 
@@ -9,16 +8,15 @@ interface SupabaseCredentials {
   anonKey: string;
 }
 
-function loadEnv(): void {
-  if (envLoaded || (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY)) {
+function loadEnv(keyName = 'COZE_SUPABASE_SERVICE_ROLE_KEY'): void {
+  if (envLoaded || (process.env.COZE_SUPABASE_URL && process.env[keyName]?.trim())) {
     return;
   }
 
   try {
     try {
       require('dotenv').config();
-      if (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY) {
-        envLoaded = true;
+      if (process.env.COZE_SUPABASE_URL && process.env[keyName]?.trim()) {
         return;
       }
     } catch {
@@ -56,7 +54,7 @@ except Exception as e:
             (value.startsWith('"') && value.endsWith('"'))) {
           value = value.slice(1, -1);
         }
-        if (!process.env[key]) {
+      if (!process.env[key]?.trim()) {
           process.env[key] = value;
         }
       }
@@ -69,10 +67,10 @@ except Exception as e:
 }
 
 function getSupabaseCredentials(): SupabaseCredentials {
-  loadEnv();
+  loadEnv('COZE_SUPABASE_ANON_KEY');
 
   const url = process.env.COZE_SUPABASE_URL;
-  const anonKey = process.env.COZE_SUPABASE_ANON_KEY;
+  const anonKey = process.env.COZE_SUPABASE_ANON_KEY?.trim();
 
   if (!url) {
     throw new Error('COZE_SUPABASE_URL is not set');
@@ -86,35 +84,20 @@ function getSupabaseCredentials(): SupabaseCredentials {
 
 function getSupabaseServiceRoleKey(): string | undefined {
   loadEnv();
-  return process.env.COZE_SUPABASE_SERVICE_ROLE_KEY;
+  return process.env.COZE_SUPABASE_SERVICE_ROLE_KEY?.trim();
 }
 
 function getSupabaseClient(token?: string): SupabaseClient {
-  const { url, anonKey } = getSupabaseCredentials();
+  const scopedCredentials = token ? getSupabaseCredentials() : null;
+  const key = scopedCredentials ? scopedCredentials.anonKey : getSupabaseServiceRoleKey();
+  if (!key) throw new Error('COZE_SUPABASE_SERVICE_ROLE_KEY is not set');
 
-  let key: string;
-  if (token) {
-    key = anonKey;
-  } else {
-    const serviceRoleKey = getSupabaseServiceRoleKey();
-    key = serviceRoleKey ?? anonKey;
-  }
+  const url = scopedCredentials?.url ?? process.env.COZE_SUPABASE_URL;
+  if (!url) throw new Error('COZE_SUPABASE_URL is not set');
 
-  const globalOptions: Record<string, any> = {};
-  if (token) {
-    globalOptions.headers = { Authorization: `Bearer ${token}` };
-  }
-  try {
-    const buffer = getReportBuffer();
-    if (buffer) {
-      globalOptions.fetch = createWrappedFetch(buffer, 'supabase');
-    }
-  } catch {
-    // Silent — reporting setup failure should not block client creation
-  }
-
+  // The SDK fetch reporter captures database bodies and URLs containing auth data.
   return createClient(url, key, {
-    global: globalOptions,
+    global: token ? { headers: { Authorization: `Bearer ${token}` } } : {},
     db: {
       timeout: 60000,
     },
