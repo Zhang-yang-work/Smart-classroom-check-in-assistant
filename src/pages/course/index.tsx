@@ -79,8 +79,8 @@ export default function CoursePage() {
     });
   }
 
-  async function upload(target: GroupTarget, path: string) {
-    const rows = await importRosterExcel(target.courseId, target.id, path);
+  async function upload(target: GroupTarget, path: string, fileName?: string) {
+    const rows = await importRosterExcel(target.courseId, target.id, path, fileName);
     await refreshRoster(target);
     Taro.showToast({ title: `已导入 ${rows.length} 人`, icon: 'success' });
   }
@@ -180,7 +180,8 @@ export default function CoursePage() {
             if (!file || !target) return;
             void run(async () => {
               const url = URL.createObjectURL(file);
-              try { await upload(target, url); } finally { URL.revokeObjectURL(url); }
+              // A Blob URL preserves the bytes, but Taro needs the original name for multipart.
+              try { await upload(target, url, file.name); } finally { URL.revokeObjectURL(url); }
             });
           }}
         />

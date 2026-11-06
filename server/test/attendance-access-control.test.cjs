@@ -231,7 +231,31 @@ test('Agent 详情和缺勤工具继承权限，合法查询仍返回业务结�
   const response = chat({ type: 'query', tool: 'get_absentees', arguments: { task_id: 'task-a' } });
   expectTeacherDetail(true);
   await response;
-  assert.deepEqual(toolResult('get_absentees').absentees, [otherParticipant]);
+  const result = toolResult('get_absentees');
+  assert.equal(result.task_status, 'ended');
+  assert.deepEqual(result.unsigned, []);
+  assert.deepEqual(result.absentees, [otherParticipant]);
+});
+
+test('Agent 分开返回进行中的未签到和教师已标记缺勤', async () => {
+  const manuallyAbsent = { student_no: '003', student_name: '学生 C' };
+  const response = chat({ type: 'query', tool: 'get_absentees', arguments: { task_id: 'task-a' } });
+  expectTeacherTask('task-a', {
+    task,
+    participants: [
+      { ...participant, status: 'present' },
+      { ...otherParticipant, status: null },
+      { ...manuallyAbsent, status: 'absent' },
+      { student_no: '004', student_name: '学生 D', status: 'excused' },
+    ],
+  });
+  await response;
+  const result = toolResult('get_absentees');
+  assert.equal(result.task_status, 'active');
+  assert.deepEqual(result.unsigned, [otherParticipant]);
+  assert.deepEqual(result.absentees, [manuallyAbsent]);
+  const prompt = model.mock.calls.at(-1).arguments[0].find(message => message.role === 'system').content;
+  assert.match(prompt, /尚未签到.*教师已标记缺勤.*最终缺勤/);
 });
 
 test('Agent 确认无法越权补签，合法补签仍可执行', async () => {

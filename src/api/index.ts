@@ -121,7 +121,7 @@ export function getRoster(courseId: string, groupId: string): Promise<RosterItem
   return request({ url: `/api/courses/${courseId}/groups/${groupId}/roster` });
 }
 
-export function importRosterExcel(courseId: string, groupId: string, filePath: string): Promise<RosterItem[]> {
+export function importRosterExcel(courseId: string, groupId: string, filePath: string, fileName?: string): Promise<RosterItem[]> {
   const header: Record<string, string> = {};
   const token = getToken();
   if (token) header.Authorization = `Bearer ${token}`;
@@ -132,6 +132,7 @@ export function importRosterExcel(courseId: string, groupId: string, filePath: s
   return (Network.uploadFile({
     url,
     filePath,
+    ...(fileName ? { fileName } : {}),
     name: 'file',
     header,
   } as any) as unknown as Promise<{ statusCode: number; data: string }>).then((res: any) => {
