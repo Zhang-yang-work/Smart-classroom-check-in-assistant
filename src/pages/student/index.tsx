@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import Taro, { useDidShow } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Card, CardContent } from '@/components/ui/card';
@@ -10,7 +10,8 @@ import { LogOut } from 'lucide-react-taro';
 import { listCourses, listStudentTasks, signIn } from '@/api';
 import { getUser } from '@/utils/storage';
 import { logout } from '@/utils/logout';
-import { formatDateTime, statusText } from '@/utils/format';
+import { formatDateTime, modeText, statusText } from '@/utils/format';
+import { currentLocation, scanAttendanceQr } from '@/utils/attendance-proof';
 import type { Course, Task } from '@/api/types';
 
 function countdownLeft(endAt: string): string {
@@ -27,6 +28,7 @@ export default function StudentPage() {
   const [history, setHistory] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [signingId, setSigningId] = useState('');
+  const busy = useRef(false);
 
   const load = async () => {
     setLoading(true);
@@ -48,16 +50,28 @@ export default function StudentPage() {
 
   const user = getUser();
 
-  const doSign = async (taskId: string) => {
-    setSigningId(taskId);
+  const doSign = async (task?: Task) => {
+    if (busy.current) return;
+    busy.current = true;
+    setSigningId(task?.id ?? 'scan');
     try {
-      const record = await signIn(taskId);
+      let record;
+      if (!task || task.mode === 'qr') {
+        const scanned = await scanAttendanceQr(task?.id);
+        if (!scanned) return;
+        record = await signIn(scanned.taskId, { qr_token: scanned.token });
+      } else if (task.mode === 'location') {
+        record = await signIn(task.id, { location: await currentLocation() });
+      } else {
+        record = await signIn(task.id);
+      }
       Taro.showToast({ title: statusText(record.status), icon: 'success' });
       await load();
     } catch (e) {
-      Taro.showToast({ title: (e as Error).message, icon: 'none' });
+      Taro.showToast({ title: (e as Error).message, icon: 'none', duration: 3500 });
       await load();
     } finally {
+      busy.current = false;
       setSigningId('');
     }
   };
@@ -99,6 +113,7 @@ export default function StudentPage() {
           <View className="flex items-center justify-between mb-3">
             <Text className="block text-sm font-semibold">进行中的签到</Text>
             <Button variant="outline" size="sm" onClick={load}>刷新</Button>
+            <Button variant="outline" size="sm" disabled={!!signingId} onClick={() => doSign()}>扫一扫</Button>
           </View>
           {ongoing.length === 0 ? (
             <Card>
@@ -122,6 +137,9 @@ export default function StudentPage() {
                           {formatDateTime(t.start_at)} 发布 · {countdownLeft(t.end_at)}
                         </Text>
                         <Text className="block text-xs text-muted-foreground">
+                          {modeText(t.mode)}{t.location_name ? ` · ${t.location_name} · ${t.location_radius_m} 米` : ''}
+                        </Text>
+                        <Text className="block text-xs text-muted-foreground">
                           正常截止 {formatDateTime(t.normal_end_at || t.end_at)}
                           {t.normal_end_at && t.normal_end_at !== t.end_at ? ` · 迟到截止 ${formatDateTime(t.end_at)}` : ''}
                         </Text>
@@ -131,10 +149,10 @@ export default function StudentPage() {
                       ) : (
                         <Button
                           size="sm"
-                          disabled={signingId === t.id}
-                          onClick={() => doSign(t.id)}
+                          disabled={!!signingId}
+                          onClick={() => doSign(t)}
                         >
-                          立即签到
+                          {t.mode === 'location' ? '定位并签到' : t.mode === 'qr' ? '扫码签到' : '立即签到'}
                         </Button>
                       )}
                     </View>

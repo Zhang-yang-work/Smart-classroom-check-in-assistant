@@ -10,6 +10,8 @@ import type {
   AgentChatResponse,
   TeachingGroup,
   FinalAttendanceStatus,
+  AttendanceMode,
+  AttendanceLocation,
 } from './types';
 
 interface ApiEnvelope<T = any> {
@@ -157,6 +159,10 @@ export function createTask(data: {
   group_ids: string[];
   duration_minutes: number;
   late_minutes: number;
+  mode: AttendanceMode;
+  location?: AttendanceLocation;
+  location_preset_id?: string;
+  radius_m?: number;
 }): Promise<Task> {
   return request({ url: '/api/attendance', method: 'POST', data });
 }
@@ -173,8 +179,17 @@ export function getTaskDetail(taskId: string): Promise<TaskDetail> {
   return request({ url: `/api/attendance/${taskId}` });
 }
 
-export function signIn(taskId: string): Promise<{ id: string; status: string; signed_at: string }> {
-  return request({ url: `/api/attendance/${taskId}/sign`, method: 'POST' });
+export function listLocationPresets(): Promise<Array<{ id: string; name: string }>> {
+  return request({ url: '/api/attendance/location-presets' });
+}
+
+export function getAttendanceQr(taskId: string): Promise<{ rows: string[]; refresh_in_ms: number }> {
+  return request({ url: `/api/attendance/${taskId}/qr` });
+}
+
+export function signIn(taskId: string, data?: { location?: AttendanceLocation; qr_token?: string }):
+Promise<{ id: string; status: string; signed_at: string }> {
+  return request({ url: `/api/attendance/${taskId}/sign`, method: 'POST', data });
 }
 
 export function endTask(taskId: string) {

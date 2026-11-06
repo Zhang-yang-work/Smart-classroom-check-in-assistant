@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import Taro, { useLoad } from '@tarojs/taro';
+import Taro, { useDidHide, useDidShow, useLoad } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -8,8 +8,9 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
 import { adjustAttendance, endTask, getTaskDetail } from '@/api';
-import { formatDateTime, statusText } from '@/utils/format';
+import { formatDateTime, modeText, statusText } from '@/utils/format';
 import type { AttendanceSummary, FinalAttendanceStatus, TaskDetail, Participant } from '@/api/types';
+import { QrDisplay } from './qr-display';
 
 const FINAL_STATUSES: FinalAttendanceStatus[] = ['present', 'late', 'excused', 'absent'];
 
@@ -36,6 +37,9 @@ export default function DetailPage() {
   const [reason, setReason] = useState('');
   const [saving, setSaving] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
+  const [visible, setVisible] = useState(true);
+  useDidShow(() => setVisible(true));
+  useDidHide(() => setVisible(false));
 
   async function load(id: string) {
     if (!id) { setLoading(false); return; }
@@ -97,10 +101,14 @@ export default function DetailPage() {
                 <Badge variant={active ? 'default' : 'secondary'}>{active ? '进行中' : '已结束'}</Badge>
               </View>
               <Text className="block text-xs text-muted-foreground">
+                {modeText(task.mode)}{task.location_name ? ` · ${task.location_name} · ${task.location_radius_m} 米` : ''}
+              </Text>
+              <Text className="block text-xs text-muted-foreground">
                 正常截止 {formatDateTime(task.normal_end_at || task.end_at)}
                 {task.normal_end_at && task.normal_end_at !== task.end_at ? ` · 迟到截止 ${formatDateTime(task.end_at)}` : ''}
               </Text>
               {task.ended_at && <Text className="block text-xs text-muted-foreground">提前结束于 {formatDateTime(task.ended_at)}</Text>}
+              {visible && active && !confirmEnd && !selected && detail?.summary && task.mode === 'qr' && <QrDisplay taskId={task.id} />}
               <View className="flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" onClick={() => load(taskId)}>刷新统计</Button>
                 {active && detail?.summary && <Button size="sm" variant="destructive" onClick={() => setConfirmEnd(true)}>提前结束</Button>}

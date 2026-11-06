@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Header, Param, Post, UseGuards } from '@nestjs/common';
 import { AttendanceService } from './attendance.service';
 import { AuthGuard, CurrentUser, AuthUser } from '@/common/auth';
 
@@ -25,6 +25,17 @@ export class AttendanceController {
     return this.attendanceService.listTasksForStudent(user);
   }
 
+  @Get('location-presets')
+  locationPresets(@CurrentUser() user: AuthUser) {
+    return this.attendanceService.listLocationPresets(user);
+  }
+
+  @Get(':id/qr')
+  @Header('Cache-Control', 'no-store')
+  qr(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.attendanceService.getQr(user, id);
+  }
+
   @Get(':id')
   async detail(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.attendanceService.getTaskDetail(user, id);
@@ -32,8 +43,8 @@ export class AttendanceController {
 
   // 学生：签到
   @Post(':id/sign')
-  async signIn(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.attendanceService.signIn(user, id);
+  async signIn(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body?: any) {
+    return this.attendanceService.signIn(user, id, body);
   }
 
   @Post(':id/end')
