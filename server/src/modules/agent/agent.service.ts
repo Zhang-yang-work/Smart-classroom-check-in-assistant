@@ -136,8 +136,8 @@ export class AgentService {
         customHeaders,
       );
       return res.content || '';
-    } catch (e) {
-      this.logger.error(`LLM 调用失败: ${(e as Error).message}`);
+    } catch {
+      this.logger.error('LLM 调用失败');
       throw new BadRequestException('AI 服务暂时不可用，请稍后重试');
     }
   }

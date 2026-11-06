@@ -10,29 +10,43 @@ export class SeedService implements OnModuleInit {
   private readonly logger = new Logger(SeedService.name);
 
   async onModuleInit(): Promise<void> {
+    if (process.env.NODE_ENV !== 'test' || process.env.ENABLE_DEMO_SEED !== 'true') return;
+
+    const url = URL.parse(process.env.COZE_SUPABASE_URL || '');
+    const teacherCode = process.env.DEMO_SEED_TEACHER_CODE?.trim();
+    if (!url || !['http:', 'https:'].includes(url.protocol)
+      || !['127.0.0.1', '[::1]'].includes(url.hostname)
+      || !process.env.COZE_SUPABASE_SERVICE_ROLE_KEY?.trim()
+      || !teacherCode || teacherCode.length < 32 || teacherCode.length > 64) {
+      this.logger.warn('已跳过演示种子：需要独立的本机测试库、服务端密钥和 32 至 64 字符的测试口令。');
+      return;
+    }
+
     try {
-      await this.seed();
-    } catch (e) {
-      this.logger.warn(`初始化种子数据失败（不影响启动）: ${(e as Error).message}`);
+      await this.seed(teacherCode);
+    } catch {
+      this.logger.warn('初始化演示种子失败，请检查本机测试数据库配置。');
     }
   }
 
-  private async seed(): Promise<void> {
+  private async seed(teacherCode: string): Promise<void> {
     const client = getSupabaseClient();
 
     // 1. 默认教师
     let teacherId: string | undefined;
-    const { data: existingTeacher } = await client
+    const { data: existingTeacher, error: teacherErr } = await client
       .from('users')
       .select('id')
-      .eq('teacher_code', 'TEACHER2026')
+      .eq('role', 'teacher')
+      .eq('teacher_code', teacherCode)
       .maybeSingle();
+    if (teacherErr) throw teacherErr;
     if (existingTeacher) {
       teacherId = existingTeacher.id;
     } else {
       const { data: created, error } = await client
         .from('users')
-        .insert({ role: 'teacher', name: '王老师', teacher_code: 'TEACHER2026' })
+        .insert({ role: 'teacher', name: '王老师', teacher_code: teacherCode })
         .select('id')
         .single();
       if (error) throw new Error(`创建教师失败: ${error.message}`);
@@ -40,12 +54,13 @@ export class SeedService implements OnModuleInit {
     }
 
     // 2. 示例课程 + 名单
-    const { data: existingCourse } = await client
+    const { data: existingCourse, error: lookupErr } = await client
       .from('courses')
       .select('id')
       .eq('name', '数据库系统概论')
       .eq('teacher_user_id', teacherId)
       .maybeSingle();
+    if (lookupErr) throw lookupErr;
 
     if (!existingCourse) {
       const { data: course, error: courseErr } = await client
@@ -65,6 +80,6 @@ export class SeedService implements OnModuleInit {
       if (rosterErr) throw new Error(`创建名单失败: ${rosterErr.message}`);
     }
 
-    this.logger.log('种子数据就绪：教师口令 TEACHER2026；示例课程「数据库系统概论」含 3 名学生。');
+    this.logger.log('本机测试库演示种子已就绪。');
   }
 }

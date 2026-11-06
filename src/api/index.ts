@@ -25,7 +25,8 @@ async function request<T = any>(options: {
   const token = getToken();
   if (token) header.Authorization = `Bearer ${token}`;
 
-  console.log('[API REQUEST]', JSON.stringify({ url, method, data, header }));
+  const path = url.split(/[?#]/, 1)[0];
+  console.log('[API REQUEST]', { method, path });
 
   const res: any = await Network.request({
     url,
@@ -34,7 +35,7 @@ async function request<T = any>(options: {
     header,
   } as any);
 
-  console.log('[API RESPONSE]', JSON.stringify({ url, statusCode: res?.statusCode, data: res?.data }));
+  console.log('[API RESPONSE]', { method, path, statusCode: res?.statusCode });
 
   const body = res?.data as ApiEnvelope<T> | undefined;
   if (!res || res.statusCode >= 400) {
@@ -100,7 +101,7 @@ export function importRosterExcel(courseId: string, filePath: string): Promise<R
   if (token) header.Authorization = `Bearer ${token}`;
 
   const url = `/api/courses/${courseId}/roster/import-excel`;
-  console.log('[API UPLOAD]', JSON.stringify({ url, name: 'file', filePath, header }));
+  console.log('[API UPLOAD]', { method: 'POST', path: '/api/courses/:courseId/roster/import-excel' });
 
   return (Network.uploadFile({
     url,
@@ -108,7 +109,7 @@ export function importRosterExcel(courseId: string, filePath: string): Promise<R
     name: 'file',
     header,
   } as any) as unknown as Promise<{ statusCode: number; data: string }>).then((res: any) => {
-    console.log('[API UPLOAD RESPONSE]', JSON.stringify({ statusCode: res?.statusCode, data: res?.data }));
+    console.log('[API UPLOAD RESPONSE]', { statusCode: res?.statusCode });
     let body: ApiEnvelope<RosterItem[]> | undefined;
     try {
       body = typeof res?.data === 'string' ? JSON.parse(res.data) : res?.data;
