@@ -1,12 +1,13 @@
 import { useState } from 'react';
-import Taro from '@tarojs/taro';
+import Taro, { useDidShow } from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Textarea } from '@/components/ui/textarea';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Bot, Send } from 'lucide-react-taro';
-import { agentChat, agentConfirm } from '@/api';
+import { agentChat, agentConfirm, listLocationPresets } from '@/api';
 import type { AttendanceLocation } from '@/api/types';
 import { currentLocation } from '@/utils/attendance-proof';
 
@@ -35,12 +36,31 @@ export default function AiPage() {
   const [pending, setPending] = useState<Pending | null>(null);
   const [location, setLocation] = useState<AttendanceLocation>();
   const [locating, setLocating] = useState(false);
+  const [presets, setPresets] = useState<Array<{ id: string; name: string }>>([]);
+  const [presetId, setPresetId] = useState('');
+  const [presetError, setPresetError] = useState('');
+  // The H5 fallback only supports WGS84; this project has no configured GCJ-02 JS-SDK bridge.
+  const canLocate = Taro.getEnv() === Taro.ENV_TYPE.WEAPP && typeof Taro.getLocation === 'function';
+
+  useDidShow(() => {
+    void listLocationPresets().then(items => {
+      setPresets(items);
+      setPresetError('');
+      setPresetId('');
+    }).catch(() => {
+      setPresets([]);
+      setPresetId('');
+      setPresetError('预设建筑加载失败，请稍后重新进入页面重试');
+    });
+  });
 
   const append = (msg: ChatMsg) => setMessages((prev) => [...prev, msg]);
 
   const attachLocation = async () => {
+    if (!canLocate || sending || locating) return;
     setLocating(true);
     setLocation(undefined);
+    setPresetId('');
     try {
       setLocation(await currentLocation());
     } catch (error) {
@@ -61,7 +81,9 @@ export default function AiPage() {
     setPending(null);
     setLocation(undefined);
     try {
-      const res = await agentChat(history.map((m) => ({ role: m.role, content: m.content })), location);
+      const res = await agentChat(history.map((m) => ({ role: m.role, content: m.content })), location, {
+        location_supported: canLocate, location_preset_id: presetId || undefined,
+      });
       if (res.type === 'reply') {
         append({ role: 'assistant', content: res.content || '（无响应）' });
       } else if (res.type === 'confirm') {
@@ -163,13 +185,27 @@ export default function AiPage() {
         </View>
       </ScrollArea>
 
-      {Taro.getEnv() === Taro.ENV_TYPE.WEAPP && (
-        <View className="px-5 py-2">
+      <View className="px-5 py-2 flex flex-col gap-2">
+        {canLocate ? (
           <Button variant="outline" size="sm" disabled={sending || locating} onClick={attachLocation}>
-            {locating ? '正在定位…' : location ? '已附带当前位置，点击重新定位' : '附带当前位置'}
+            {locating ? '正在定位…' : location ? '重新定位' : '附带当前位置'}
           </Button>
-        </View>
-      )}
+        ) : (
+          <Text className="block text-xs text-muted-foreground">当前 WebView/H5 预览未接入可用定位，请选择预设建筑，或在原生微信小程序中定位。</Text>
+        )}
+        {location && <Text className="block text-xs text-muted-foreground">定位成功，精度约 {Math.round(location.accuracy)} 米，将随下一条消息发送</Text>}
+        {presets.length > 0 ? (
+          <Select value={presetId} onValueChange={id => { setPresetId(id); setLocation(undefined); }}>
+            <SelectTrigger><SelectValue placeholder="位置签到可选择预设建筑" /></SelectTrigger>
+            <SelectContent>
+              {presets.map(preset => <SelectItem key={preset.id} value={preset.id}>{preset.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        ) : (
+          <Text className="block text-xs text-muted-foreground">{presetError || '暂无预设建筑；无法定位时请联系管理员配置建筑地点。'}</Text>
+        )}
+        {presetId && <Text className="block text-xs text-muted-foreground">已选择预设建筑，将随下一条消息发送</Text>}
+      </View>
 
       <View
         style={{

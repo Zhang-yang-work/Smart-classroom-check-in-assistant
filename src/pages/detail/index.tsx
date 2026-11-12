@@ -60,7 +60,7 @@ export default function DetailPage() {
   });
 
   async function save() {
-    if (!selected || !reason.trim()) return;
+    if (!selected || saving) return;
     setSaving(true);
     try {
       await adjustAttendance(taskId, { student_no: selected.student_no, status: nextStatus, reason: reason.trim() });
@@ -159,8 +159,8 @@ export default function DetailPage() {
               >{statusText(status)}</Button>
             ))}
           </View>
-          <Textarea placeholder="填写调整原因" maxlength={256} value={reason} onInput={event => setReason(event.detail.value)} />
-          <DialogFooter><Button disabled={saving || !reason.trim()} onClick={save}>保存调整</Button></DialogFooter>
+          <Textarea placeholder="调整原因（选填）" maxlength={256} value={reason} onInput={event => setReason(event.detail.value)} />
+          <DialogFooter><Button disabled={saving} onClick={save}>保存调整</Button></DialogFooter>
         </DialogContent>
       </Dialog>
 

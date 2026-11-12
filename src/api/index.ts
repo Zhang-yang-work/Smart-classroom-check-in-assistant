@@ -198,14 +198,17 @@ export function endTask(taskId: string) {
 
 export function adjustAttendance(
   taskId: string,
-  data: { student_no: string; reason: string; status: FinalAttendanceStatus },
+  data: { student_no: string; reason?: string | null; status: FinalAttendanceStatus },
 ): Promise<{ id: string; status: string; makeup_at: string }> {
   return request({ url: `/api/attendance/${taskId}/adjust`, method: 'POST', data });
 }
 
 // ---- AI 助手 ----
-export function agentChat(messages: Array<{ role: string; content: string }>, location?: AttendanceLocation): Promise<AgentChatResponse> {
-  return request({ url: '/api/agent/chat', method: 'POST', data: { messages, location } });
+export function agentChat(
+  messages: Array<{ role: string; content: string }>, location?: AttendanceLocation,
+  options?: { location_supported: boolean; location_preset_id?: string },
+): Promise<AgentChatResponse> {
+  return request({ url: '/api/agent/chat', method: 'POST', data: { messages, location, ...options } });
 }
 
 export function agentConfirm(pendingId: string): Promise<{ type: string; content: string }> {

@@ -57,7 +57,8 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
       makeup_by varchar(36) REFERENCES users(id), makeup_reason varchar(256), updated_at timestamptz,
       UNIQUE(task_id,student_no));
     CREATE TABLE operation_logs (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), operator_user_id varchar(36) REFERENCES users(id),
-      action text NOT NULL, task_id varchar(36), student_no varchar(64), details jsonb);
+      action text NOT NULL, task_id varchar(36), student_no varchar(64), details jsonb,
+      created_at timestamptz NOT NULL DEFAULT now());
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
     INSERT INTO users(id,role,name,student_no) VALUES
       ('teacher','teacher','甲老师',NULL),('foreign-teacher','teacher','乙老师',NULL),
@@ -76,7 +77,7 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   const oldTask = await scalar("SELECT to_jsonb(t) FROM attendance_tasks t WHERE id='legacy-task'");
   const oldSnapshot = await scalar("SELECT to_jsonb(p) FROM attendance_participants p WHERE task_id='legacy-task'");
   const oldRecord = await scalar("SELECT to_jsonb(r) FROM attendance_records r WHERE id='legacy-record'");
-  for (const migration of ['001-wechat-identity.sql', '002-teaching-groups-attendance.sql', '003-location-qr-attendance.sql']) {
+  for (const migration of ['001-wechat-identity.sql', '002-teaching-groups-attendance.sql', '003-location-qr-attendance.sql', '004-optional-attendance-reason.sql']) {
     await query(readFileSync(join(__dirname, '../database/migrations', migration), 'utf8'));
   }
   assert.deepEqual(await scalar(`SELECT to_jsonb(t) - ARRAY['normal_end_at','ended_at','group_snapshot',
@@ -234,7 +235,6 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   const database = { getSupabaseClient: () => ({
     async rpc(name, parameters) {
       assert.equal(name, 'attendance_publish');
-      assert.equal(parameters.p_groups, null);
       const names = Object.keys(parameters);
       assert.ok(names.every(key => /^p_[a-z_]+$/.test(key)));
       const args = names.map((key, i) => key + ' => $' + (i + 1)).join(',');
@@ -251,11 +251,12 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   const { AttendanceService } = loadSource('modules/attendance/attendance.service', dependencies);
   const { AgentService } = loadSource('modules/agent/agent.service', dependencies);
   const agent = new AgentService(new AttendanceService());
-  agent.buildContext = async () => ({ courses: [{ id: 'course', name: '一号课程' }], tasks: [], location_presets: [{ id: 'library', name: '测试图书馆' }] });
+  const actualGroups = (await query("SELECT id,name FROM teaching_groups WHERE course_id='course' ORDER BY id")).rows;
+  agent.buildContext = async () => ({ courses: [{ id: 'course', name: '一号课程', groups: actualGroups }], tasks: [], location_presets: [{ id: 'library', name: '测试图书馆' }] });
   const teacher = { id: 'teacher', role: 'teacher', name: '甲老师', student_no: null };
   const create = async (mode, settings = {}, location) => {
     agent.client.invoke = async () => ({ content: JSON.stringify({ type: 'confirm', tool: 'create_attendance',
-      arguments: { course_id: 'course', mode, duration_minutes: 7, late_minutes: 2, ...settings } }) });
+      arguments: { course_id: 'course', mode, duration_minutes: 7, late_minutes: 2, all_groups: true, ...settings } }) });
     return agent.chat(teacher, {}, { messages: [{ role: 'user', content: '发布签到' }], location });
   };
   for (const [mode, settings, attachment] of [
@@ -281,6 +282,41 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   const beforeMissing = await scalar('SELECT count(*)::int FROM attendance_tasks');
   const missing = await create('location');
   assert.equal(missing.type, 'reply');
-  assert.match(missing.content, /附带当前位置/);
+  assert.match(missing.content, /预设建筑/);
   assert.equal(await scalar('SELECT count(*)::int FROM attendance_tasks'), beforeMissing);
+
+  for (const [ids, expectedStudents] of [[[oldGroup], ['001']], [['g2','g3'], ['002','003','004']]]) {
+    const selected = await create('normal', { all_groups: false, group_ids: ids, duration_minutes: 5, late_minutes: undefined });
+    assert.equal(selected.type, 'confirm');
+    await agent.confirm(teacher, { pending_id: selected.pending_id });
+    const created = (await query('SELECT * FROM attendance_tasks ORDER BY created_at DESC LIMIT 1')).rows[0];
+    assert.equal(created.group_snapshot.length, ids.length);
+    assert.deepEqual((await report('teacher', created.id)).participants.map(p=>p.student_no).sort(), expectedStudents);
+    assert.equal(created.normal_end_at.getTime(), created.end_at.getTime());
+    assert.equal(created.end_at - created.start_at, 5 * 60_000);
+    await query("UPDATE attendance_tasks SET start_at=now()-interval '5 minutes', normal_end_at=now()-interval '1 second', end_at=now()-interval '1 second' WHERE id=$1", [created.id]);
+    assert.deepEqual(await change(ids[0]===oldGroup?'s1':'s2', created.id, 'sign'), { error: 'closed' });
+  }
+
+  let previous = 'present';
+  for (const [status, reason] of [['late', null], ['excused', ''], ['absent', '  '], ['present', null]]) {
+    const changed = await change('teacher', taskId, 'adjust', '001', status, reason);
+    assert.equal(changed.status, status);
+    const record = (await query("SELECT * FROM attendance_records WHERE task_id=$1 AND student_no='001'", [taskId])).rows[0];
+    assert.equal(record.makeup_reason, null);
+    assert.equal(record.makeup_by, 'teacher');
+    assert.ok(record.makeup_at instanceof Date);
+    const log = (await query("SELECT * FROM operation_logs WHERE task_id=$1 AND student_no='001' AND action='adjust_attendance' ORDER BY created_at DESC LIMIT 1", [taskId])).rows[0];
+    assert.equal(log.operator_user_id, 'teacher');
+    assert.ok(log.created_at instanceof Date);
+    assert.equal(log.details.before, previous);
+    assert.equal(log.details.after, status);
+    assert.equal(log.details.reason, null);
+    previous = status;
+  }
+  assert.deepEqual(await change('teacher', taskId, 'adjust', '001', 'present', 'x'.repeat(257)), { error: 'invalid' });
+  const fnBefore = await scalar("SELECT pg_get_functiondef('public.attendance_change(text,text,text,text,text,text,double precision,double precision,double precision,bigint,bigint)'::regprocedure)");
+  await query(readFileSync(join(__dirname, '../database/migrations/004-optional-attendance-reason.sql'), 'utf8'));
+  assert.equal(await scalar("SELECT pg_get_functiondef('public.attendance_change(text,text,text,text,text,text,double precision,double precision,double precision,bigint,bigint)'::regprocedure)"), fnBefore);
+  assert.equal(await scalar("SELECT has_function_privilege('anon','public.attendance_change(text,text,text,text,text,text,double precision,double precision,double precision,bigint,bigint)','EXECUTE')"), false);
 });
