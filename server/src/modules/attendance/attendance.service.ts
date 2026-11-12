@@ -53,7 +53,7 @@ export class AttendanceService {
       || groups.some(id => typeof id !== 'string' || !id || id.length > 36))) {
       throw new BadRequestException('请选择一个或多个教学班');
     }
-    const mode = allGroups ? 'normal' : body.mode ?? 'normal';
+    const mode = body.mode ?? 'normal';
     if (mode !== 'normal' && mode !== 'location' && mode !== 'qr') {
       throw new BadRequestException('请选择有效的签到方式');
     }

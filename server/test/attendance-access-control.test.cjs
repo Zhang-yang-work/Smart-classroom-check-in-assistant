@@ -209,12 +209,12 @@ test('合法签到和补签仍写入对应考勤及操作日志', async () => {
   assert.equal((await attendance.makeup(teacher, 'task-a', { student_no: '002', reason: '补签' })).status, 'present');
 });
 
-async function chat(proposal) {
-  expectQuery('courses', { teacher_user_id: 'eq.teacher-a', select: 'id,name' }, []);
+async function chat(proposal, location) {
+  expectQuery('courses', { teacher_user_id: 'eq.teacher-a', select: 'id,name' }, [{ id: 'course-a', name: '课程 A' }]);
   expectQuery('courses', { teacher_user_id: 'eq.teacher-a', select: 'id,name' }, []);
   model.mock.mockImplementationOnce(async () => ({ content: JSON.stringify(proposal) }));
   model.mock.mockImplementation(async () => ({ content: '{"type":"reply","content":"查询结束"}' }));
-  return agent.chat(teacher, { headers: {} }, { messages: [{ role: 'user', content: '测试工具调用' }] });
+  return agent.chat(teacher, { headers: {} }, { messages: [{ role: 'user', content: '测试工具调用' }], location });
 }
 
 function toolResult(tool) {
@@ -276,16 +276,100 @@ test('Agent 确认无法越权补签，合法补签仍可执行', async () => {
   assert.match((await agent.confirm(teacher, { pending_id: allowed.pending_id })).content, /完成补签/);
 });
 
-test('Agent 发布仍需教师确认且只能发布普通签到', async () => {
-  const proposal = await chat({
-    type: 'confirm', tool: 'create_attendance',
-    arguments: { course_id: 'course-a', duration_minutes: 5, mode: 'qr' },
+test('Agent 三种签到传递实际类型、覆盖全部教学班并展示真实确认参数', async t => {
+  const oldSecret = process.env.ATTENDANCE_QR_SECRET;
+  const oldPresets = process.env.ATTENDANCE_LOCATION_PRESETS;
+  process.env.ATTENDANCE_QR_SECRET = randomBytes(32).toString('base64url');
+  process.env.ATTENDANCE_LOCATION_PRESETS = JSON.stringify([
+    { id: 'library', name: '测试图书馆', latitude: 31, longitude: 121 },
+  ]);
+  t.after(() => {
+    if (oldSecret === undefined) delete process.env.ATTENDANCE_QR_SECRET;
+    else process.env.ATTENDANCE_QR_SECRET = oldSecret;
+    if (oldPresets === undefined) delete process.env.ATTENDANCE_LOCATION_PRESETS;
+    else process.env.ATTENDANCE_LOCATION_PRESETS = oldPresets;
   });
+  for (const [mode, label] of [['normal', '普通签到'], ['location', '位置签到'], ['qr', '二维码签到']]) {
+    const parameters = { course_id: 'course-a', duration_minutes: 7, late_minutes: 0, mode };
+    if (mode === 'location') Object.assign(parameters, { location_preset_id: 'library', radius_m: 50 });
+    const proposal = await chat({
+      type: 'confirm', tool: 'create_attendance', arguments: parameters, summary: '模型给出的错误类型和时长',
+    });
+    assert.equal(proposal.type, 'confirm');
+    assert.equal(proposal.arguments.mode, mode);
+    assert.match(proposal.summary, new RegExp(label));
+    assert.match(proposal.summary, /课程 A.*全部教学班.*7 分钟.*关闭迟到窗口/);
+    assert.ok(!proposal.summary.includes('错误类型'));
+    if (mode === 'location') assert.match(proposal.summary, /测试图书馆.*50 米/);
+    await assert.rejects(agent.confirm(student, { pending_id: proposal.pending_id }), { status: 403 });
+    const expected = { p_actor: 'teacher-a', p_course: 'course-a', p_normal: 7, p_late: 0,
+      p_groups: null, p_mode: mode === 'normal' ? undefined : mode };
+    if (mode === 'location') Object.assign(expected, { p_lat: 31, p_lng: 121, p_radius: 50, p_location_name: '测试图书馆' });
+    expectQuery('rpc/attendance_publish', {}, { ...task, mode, total: 2 }, 'POST', expected);
+    const result = await agent.confirm(teacher, { pending_id: proposal.pending_id });
+    assert.match(result.content, new RegExp('已发布' + label));
+    await assert.rejects(agent.confirm(teacher, { pending_id: proposal.pending_id }), /已失效/);
+    model.mock.resetCalls();
+
+    const failed = await chat({ type: 'confirm', tool: 'create_attendance', arguments: parameters });
+    expectQuery('rpc/attendance_publish', {}, { error: 'invalid' }, 'POST', expected);
+    await assert.rejects(agent.confirm(teacher, { pending_id: failed.pending_id }), /确认所选教学班及签到时间/);
+    model.mock.resetCalls();
+  }
+});
+
+test('Agent 位置签到只使用显式定位附件并在确认执行时重新检查有效期', async () => {
+  const location = { latitude: 31.987654, longitude: 121.987654, accuracy: 20, captured_at_ms: Date.now() };
+  const proposal = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
+    course_id: 'course-a', mode: 'location', location: { latitude: 0, longitude: 0, accuracy: 1 },
+  } }, location);
   assert.equal(proposal.type, 'confirm');
-  await assert.rejects(agent.confirm(student, { pending_id: proposal.pending_id }), { status: 403 });
-  expectQuery('rpc/attendance_publish', {}, { ...task, total: 2 }, 'POST',
-    { p_actor: 'teacher-a', p_course: 'course-a', p_normal: 5, p_late: 5, p_groups: null, p_mode: undefined });
-  assert.match((await agent.confirm(teacher, { pending_id: proposal.pending_id })).content, /已发布签到/);
+  assert.equal(proposal.arguments.radius_m, 100);
+  assert.deepEqual(proposal.arguments.location, location);
+  assert.match(proposal.summary, /位置签到.*5 分钟.*迟到窗口 5 分钟.*31\.987654.*100 米/);
+  assert.ok(!JSON.stringify(model.mock.calls[0].arguments[0]).includes('31.987654'));
+  expectQuery('rpc/attendance_publish', {}, { ...task, mode: 'location', total: 2 }, 'POST', {
+    p_mode: 'location', p_groups: null, p_lat: location.latitude, p_lng: location.longitude, p_radius: 100,
+  });
+  await agent.confirm(teacher, { pending_id: proposal.pending_id });
+  model.mock.resetCalls();
+  const expiring = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
+    course_id: 'course-a', mode: 'location',
+  } }, location);
+  mock.method(Date, 'now', () => location.captured_at_ms + 60_001);
+  try {
+    await assert.rejects(agent.confirm(teacher, { pending_id: expiring.pending_id }), /重新定位/);
+  } finally { Date.now.mock.restore(); }
+});
+
+test('Agent 缺少或无效定位、建筑、半径、类型及二维码配置时明确拒绝且无发布调用', async t => {
+  const previous = process.env.ATTENDANCE_QR_SECRET;
+  delete process.env.ATTENDANCE_QR_SECRET;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ATTENDANCE_QR_SECRET;
+    else process.env.ATTENDANCE_QR_SECRET = previous;
+  });
+  const valid = { course_id: 'course-a', mode: 'location' };
+  const location = { latitude: 31, longitude: 121, accuracy: 10, captured_at_ms: Date.now() };
+  const cases = [
+    [valid, undefined, /附带当前位置/],
+    [{ ...valid, location }, undefined, /附带当前位置/],
+    [valid, { ...location, latitude: 91 }, /附带当前位置/],
+    [valid, { ...location, captured_at_ms: Date.now() - 61_000 }, /重新定位/],
+    [{ ...valid, radius_m: 50 }, { ...location, accuracy: 80 }, /重新定位/],
+    [{ ...valid, location_preset_id: 'missing' }, undefined, /预设建筑不可用/],
+    [{ ...valid, radius_m: 75 }, location, /有效.*半径/],
+    [{ ...valid, mode: 'invalid' }, location, /明确签到类型/],
+    [{ course_id: 'course-a' }, undefined, /明确签到类型/],
+    [{ ...valid, mode: 'qr' }, undefined, /二维码签到尚未配置/],
+  ];
+  for (const [parameters, attachment, message] of cases) {
+    const result = await chat({ type: 'confirm', tool: 'create_attendance', arguments: parameters }, attachment);
+    assert.equal(result.type, 'reply');
+    assert.equal(result.pending_id, undefined);
+    assert.match(result.content, message);
+    model.mock.resetCalls();
+  }
 });
 
 test('二维码只为有权教师签发，签名绑定任务和有效期', async t => {

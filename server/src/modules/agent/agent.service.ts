@@ -1,9 +1,21 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, HttpException, Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
+import { z } from 'zod';
 import { LLMClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AuthUser, requireTeacher } from '@/common/auth';
 import { AttendanceService } from '@/modules/attendance/attendance.service';
+import { locationPresets, locationProof, requireQrSecret } from '@/modules/attendance/attendance-proof';
+
+const ATTENDANCE_MODES = { normal: '普通签到', location: '位置签到', qr: '二维码签到' };
+const attendanceArguments = z.object({
+  course_id: z.string().trim().min(1).max(36),
+  mode: z.enum(['normal', 'location', 'qr']),
+  duration_minutes: z.coerce.number().int().min(1).max(1440).default(5),
+  late_minutes: z.coerce.number().int().min(0).max(1440).default(5),
+  location_preset_id: z.string().trim().min(1).max(64).optional(),
+  radius_m: z.union([z.literal(50), z.literal(100), z.literal(200)]).default(100),
+});
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -36,7 +48,7 @@ export class AgentService {
 
   constructor(private readonly attendanceService: AttendanceService) {}
 
-  async chat(user: AuthUser, headers: Record<string, any>, body: { messages?: ChatMessage[] }) {
+  async chat(user: AuthUser, headers: Record<string, any>, body: { messages?: ChatMessage[]; location?: unknown }) {
     requireTeacher(user);
     const messages = Array.isArray(body?.messages) ? body.messages : [];
     if (messages.length === 0) throw new BadRequestException('消息不能为空');
@@ -44,7 +56,7 @@ export class AgentService {
     const customHeaders = HeaderUtils.extractForwardHeaders(headers || {});
     const context = await this.buildContext(user);
 
-    const system = this.buildSystemPrompt(user, context);
+    const system = this.buildSystemPrompt(user, context, body.location !== undefined);
     const llmMessages: Array<{ role: string; content: string }> = [
       { role: 'system', content: system },
       ...messages.map((m) => ({ role: m.role, content: m.content })),
@@ -69,18 +81,38 @@ export class AgentService {
       }
 
       if (parsed.type === 'confirm') {
+        let args = parsed.arguments || {};
+        let summary = String(parsed.summary || '请确认是否执行该操作');
+        if (parsed.tool === 'create_attendance') {
+          try {
+            args = this.prepareAttendance(args, body.location);
+            const course = context.courses.find(course => course.id === args.course_id);
+            if (!course) throw new BadRequestException('请选择你负责的课程后再发布签到');
+            const late = args.late_minutes === 0 ? '关闭迟到窗口' : `迟到窗口 ${args.late_minutes} 分钟`;
+            summary = `发布${ATTENDANCE_MODES[args.mode]}，课程「${course.name}」的全部教学班，正常签到 ${args.duration_minutes} 分钟，${late}`;
+            if (args.mode === 'location') {
+              const preset = args.location_preset_id === undefined ? undefined
+                : locationPresets().find(item => item.id === args.location_preset_id);
+              const center = preset ? preset.name : `本次获取的教师定位（${args.location.latitude}, ${args.location.longitude}）`;
+              summary += `，中心为${center}，半径 ${args.radius_m} 米`;
+            }
+          } catch (error) {
+            if (error instanceof HttpException) return { type: 'reply', content: error.message };
+            throw error;
+          }
+        }
         const pendingId = randomUUID();
         this.pending.set(pendingId, {
           tool: parsed.tool,
-          arguments: parsed.arguments || {},
+          arguments: args,
           user,
         });
         return {
           type: 'confirm',
           pending_id: pendingId,
           tool: parsed.tool,
-          summary: String(parsed.summary || '请确认是否执行该操作'),
-          arguments: parsed.arguments || {},
+          summary,
+          arguments: args,
         };
       }
 
@@ -163,10 +195,7 @@ export class AgentService {
   private async executeWriteTool(tool: string, args: any, user: AuthUser) {
     switch (tool) {
       case 'create_attendance':
-        return this.attendanceService.createTask(user, {
-          course_id: args?.course_id,
-          duration_minutes: Number(args?.duration_minutes) || 5,
-        }, true);
+        return this.attendanceService.createTask(user, this.prepareAttendance(args, args?.location), true);
       case 'makeup_attendance':
         return this.attendanceService.makeup(user, args?.task_id, {
           student_no: args?.student_no,
@@ -175,6 +204,30 @@ export class AgentService {
       default:
         throw new Error(`未知操作: ${tool}`);
     }
+  }
+
+  private prepareAttendance(args: unknown, teacherLocation?: unknown) {
+    const input = attendanceArguments.safeParse(args);
+    if (!input.success) {
+      throw new BadRequestException('请明确签到类型（普通、位置或二维码），并提供有效的课程、时长和半径（50、100 或 200 米）');
+    }
+    const parameters = input.data;
+    if (parameters.mode === 'qr') requireQrSecret();
+    if (parameters.mode !== 'location') return parameters;
+    if (parameters.location_preset_id !== undefined) {
+      if (!locationPresets().some(item => item.id === parameters.location_preset_id)) {
+        throw new BadRequestException('预设建筑不可用，请选择可用建筑或附带教师当前位置后重新发送');
+      }
+      return parameters;
+    }
+    // Coordinates come from the explicit client attachment, never from model arguments.
+    const location = locationProof.safeParse(teacherLocation);
+    const now = Date.now();
+    if (!location.success || location.data.accuracy > parameters.radius_m
+      || location.data.captured_at_ms < now - 60_000 || location.data.captured_at_ms > now + 15_000) {
+      throw new BadRequestException('位置签到需要有效位置。请点击「附带当前位置」重新定位并发送，或指定已配置的建筑及半径');
+    }
+    return { ...parameters, location: location.data };
   }
 
   private async listCourses(user: AuthUser) {
@@ -236,16 +289,24 @@ export class AgentService {
   private async buildContext(user: AuthUser) {
     const courses = await this.listCourses(user);
     const tasks = await this.attendanceService.listTasksForTeacher(user);
+    let presets: Array<{ id: string; name: string }> = [];
+    try {
+      presets = this.attendanceService.listLocationPresets(user);
+    } catch {
+      // Other Agent queries remain usable; publishing rechecks the preset configuration.
+    }
     return {
       courses,
       /* @ts-ignore */
       tasks: Array.isArray(tasks) ? tasks.slice(0, 10) : [],
+      location_presets: presets,
     };
   }
 
   private buildSystemPrompt(
     user: AuthUser,
-    context: { courses: Array<{ id: string; name: string }>; tasks: any[] },
+    context: { courses: Array<{ id: string; name: string }>; tasks: any[]; location_presets: Array<{ id: string; name: string }> },
+    hasTeacherLocation: boolean,
   ): string {
     const coursesBlock =
       context.courses.length === 0
@@ -282,19 +343,26 @@ export class AgentService {
 - list_roster：参数 {course_id}。返回课程名单。
 - get_attendance：参数 {task_id}。返回某次签到的统计与每个学生状态。
 - get_absentees：参数 {task_id}。返回任务状态、尚未签到名单（unsigned）和缺勤名单（absentees）。
-- create_attendance：参数 {course_id, duration_minutes}。为课程全部教学班发布签到，正常截止后另有 5 分钟迟到窗口（写，需确认）。
+- create_attendance：参数 {course_id, mode, duration_minutes, late_minutes?, location_preset_id?, radius_m?}。mode 必填，仅允许 normal（普通签到）、location（位置签到）、qr（动态二维码签到），覆盖课程全部教学班（写，需确认）。正常时长默认 5 分钟，迟到时长默认 5 分钟，late_minutes=0 关闭迟到窗口。
+- location 模式必须有本轮附带的教师定位，或当前上下文中真实存在且由教师选定的建筑 location_preset_id。radius_m 可选 50、100、200 米，默认 100 米。不得生成或猜测坐标，不得把文本描述当作有效定位。缺少位置条件时用 clarify 询问建筑，或引导点击「附带当前位置」再发送。
+- normal 和 qr 模式不需要位置。qr 签发任务共用的动态二维码。
 - makeup_attendance：参数 {task_id, student_no, reason}。补签（写，需确认）。
 
 ## 规则
 - 数据必须来自工具真实返回，禁止编造。
 - 签到进行中，unsigned 表述为「尚未签到」，absentees 表述为「教师已标记缺勤」，两份名单分开说明。任务已结束时，absentees 表述为「最终缺勤」。对 get_attendance 的同类状态也使用这些表述。
 - 发布签到、补签等写操作，必须用 type=confirm 请求老师确认并给出 summary。
+- 按教师要求识别三种签到方式并原样传递 mode。指定类型无法发布时明确说明原因，禁止改成其他类型。发布确认须说明实际签到类型、课程全部教学班、正常/迟到时长；位置签到还须说明位置来源和半径。
+- 「普通签到」对应 normal，「定位/位置签到」对应 location，「扫码/二维码签到」对应 qr。教师未指定方式时使用 normal；已指定方式时必须保留。
 - 读操作用 type=query 执行；拿到结果后可继续 query，最后用 type=reply 总结真实数据。
 - 课程名与 id 的对照见【当前上下文】，找不到再调用 list_courses / list_recent_tasks。
 - 老师说"N分钟"则 duration_minutes 取 N；未明确时默认取 5。
 - task_id 是长字符串，必须原样从工具结果或上下文中取用，不要自己生成。
 
 ## 当前上下文（教师：${user.name}）
+本轮教师定位附件：${hasTeacherLocation ? '已附带，发布前由服务端校验' : '未附带'}。
+可用预设建筑：${context.location_presets.map(item => `${item.name}（id=${item.id}）`).join('、') || '暂无；请使用教师当前位置'}。
+
 课程：
 ${coursesBlock}
 
@@ -306,7 +374,7 @@ ${tasksBlock}`;
     if (tool === 'create_attendance') {
       const total = result?.total ?? 0;
       const endAt = result?.end_at ? new Date(result.end_at).toLocaleTimeString('zh-CN') : '';
-      return `已发布签到：共 ${total} 名学生待签到${endAt ? `，截止 ${endAt}` : ''}。`;
+      return `已发布${ATTENDANCE_MODES[result.mode]}：共 ${total} 名学生待签到${endAt ? `，截止 ${endAt}` : ''}。`;
     }
     if (tool === 'makeup_attendance') {
       return `已为学号 ${args?.student_no} 完成补签${args?.reason ? `（原因：${args.reason}）` : ''}。`;

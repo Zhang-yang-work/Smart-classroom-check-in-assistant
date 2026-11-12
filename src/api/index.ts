@@ -204,8 +204,8 @@ export function adjustAttendance(
 }
 
 // ---- AI 助手 ----
-export function agentChat(messages: Array<{ role: string; content: string }>): Promise<AgentChatResponse> {
-  return request({ url: '/api/agent/chat', method: 'POST', data: { messages } });
+export function agentChat(messages: Array<{ role: string; content: string }>, location?: AttendanceLocation): Promise<AgentChatResponse> {
+  return request({ url: '/api/agent/chat', method: 'POST', data: { messages, location } });
 }
 
 export function agentConfirm(pendingId: string): Promise<{ type: string; content: string }> {

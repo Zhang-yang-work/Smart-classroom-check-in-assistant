@@ -72,6 +72,27 @@ test('认证和上传只记录元数据，并保留请求参数、返回值和�
   assert.doesNotMatch(output, /secret|Authorization|Bearer|teacher_code|binding_code/);
 });
 
+test('Agent API 传递显式定位附件且日志不输出坐标', async () => {
+  const received = [];
+  const logs = [];
+  const api = loadSource('src/api/index.ts', {
+    '@tarojs/taro': {},
+    '@/utils/storage': { getToken: () => 'test-session' },
+    '@/network': { Network: { request: async request => {
+      received.push(request);
+      return { statusCode: 200, data: { code: 0, data: { type: 'reply', content: '测试' } } };
+    } } },
+  }, { console: { log: (...args) => logs.push(args) } });
+  const messages = [{ role: 'user', content: '发布位置签到' }];
+  const location = { latitude: 31.987654, longitude: 121.987654, accuracy: 10, captured_at_ms: Date.now() };
+  await api.agentChat(messages, location);
+  assert.equal(received[0].url, '/api/agent/chat');
+  assert.equal(received[0].data.messages, messages);
+  assert.equal(received[0].data.location, location);
+  assert.equal(received[0].header.Authorization, 'Bearer test-session');
+  assert.doesNotMatch(JSON.stringify(logs), /31\.987654|121\.987654|test-session/);
+});
+
 test('种子初始化仅允许明确启用且指向本机隔离测试库', async () => {
   const local = {
     NODE_ENV: 'test',
