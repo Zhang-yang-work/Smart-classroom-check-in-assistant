@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import Taro from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -6,6 +7,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Textarea } from '@/components/ui/textarea';
 import { Bot, Send } from 'lucide-react-taro';
 import { agentChat, agentConfirm } from '@/api';
+import type { AttendanceLocation } from '@/api/types';
+import { currentLocation } from '@/utils/attendance-proof';
 
 interface ChatMsg {
   role: 'user' | 'assistant';
@@ -30,19 +33,35 @@ export default function AiPage() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [location, setLocation] = useState<AttendanceLocation>();
+  const [locating, setLocating] = useState(false);
 
   const append = (msg: ChatMsg) => setMessages((prev) => [...prev, msg]);
 
+  const attachLocation = async () => {
+    setLocating(true);
+    setLocation(undefined);
+    try {
+      setLocation(await currentLocation());
+    } catch (error) {
+      append({ role: 'assistant', content: (error as Error).message });
+    } finally {
+      setLocating(false);
+    }
+  };
+
   const send = async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text || sending || locating) return;
     const userMsg: ChatMsg = { role: 'user', content: text };
     const history = [...messages, userMsg];
     setMessages(history);
     setInput('');
     setSending(true);
+    setPending(null);
+    setLocation(undefined);
     try {
-      const res = await agentChat(history.map((m) => ({ role: m.role, content: m.content })));
+      const res = await agentChat(history.map((m) => ({ role: m.role, content: m.content })), location);
       if (res.type === 'reply') {
         append({ role: 'assistant', content: res.content || '（无响应）' });
       } else if (res.type === 'confirm') {
@@ -64,7 +83,7 @@ export default function AiPage() {
   };
 
   const confirmAction = async (approve: boolean) => {
-    if (!pending) return;
+    if (!pending || sending || locating) return;
     const { id } = pending;
     if (!approve) {
       setPending(null);
@@ -144,6 +163,14 @@ export default function AiPage() {
         </View>
       </ScrollArea>
 
+      {Taro.getEnv() === Taro.ENV_TYPE.WEAPP && (
+        <View className="px-5 py-2">
+          <Button variant="outline" size="sm" disabled={sending || locating} onClick={attachLocation}>
+            {locating ? '正在定位…' : location ? '已附带当前位置，点击重新定位' : '附带当前位置'}
+          </Button>
+        </View>
+      )}
+
       <View
         style={{
           display: 'flex',
@@ -163,7 +190,7 @@ export default function AiPage() {
           />
         </View>
         <View style={{ flexShrink: 0, alignSelf: 'flex-end' }}>
-          <Button size="icon" disabled={sending} onClick={send}>
+          <Button size="icon" disabled={sending || locating} onClick={send}>
             <Send size={18} color="#fff" />
           </Button>
         </View>

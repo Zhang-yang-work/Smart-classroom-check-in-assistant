@@ -3,6 +3,20 @@ const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const { Pool } = require('pg');
+const { randomBytes } = require('node:crypto');
+const { runInNewContext } = require('node:vm');
+const ts = require('typescript');
+
+function loadSource(file, dependencies) {
+  const { outputText } = ts.transpileModule(readFileSync(join(__dirname, '../src', file + '.ts'), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021, experimentalDecorators: true },
+  });
+  const exports = {};
+  runInNewContext(outputText, { exports, process, Buffer, Date,
+    require: name => Object.hasOwn(dependencies, name) ? dependencies[name] : require(name),
+  });
+  return exports;
+}
 
 test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行化考勤写入', {
   skip: !process.env.TEACHING_TEST_DATABASE_URL && '需要空白本机测试数据库',
@@ -203,4 +217,70 @@ test('教学班与普通签到迁移在独立 PostgreSQL 保留历史并串行�
   }
   await query("UPDATE attendance_tasks SET end_at=now()-interval '1 second' WHERE id=$1", [qrTask.id]);
   assert.deepEqual(await withProof('s3', qrTask.id, null, Date.now() + 5000), { error: 'closed' });
+
+  // Exercise Agent -> shared attendance service -> actual SQL with named RPC parameters.
+  const previousSecret = process.env.ATTENDANCE_QR_SECRET;
+  const previousPresets = process.env.ATTENDANCE_LOCATION_PRESETS;
+  process.env.ATTENDANCE_QR_SECRET = randomBytes(32).toString('base64url');
+  process.env.ATTENDANCE_LOCATION_PRESETS = JSON.stringify([
+    { id: 'library', name: '测试图书馆', latitude: 31, longitude: 121 },
+  ]);
+  t.after(() => {
+    if (previousSecret === undefined) delete process.env.ATTENDANCE_QR_SECRET;
+    else process.env.ATTENDANCE_QR_SECRET = previousSecret;
+    if (previousPresets === undefined) delete process.env.ATTENDANCE_LOCATION_PRESETS;
+    else process.env.ATTENDANCE_LOCATION_PRESETS = previousPresets;
+  });
+  const database = { getSupabaseClient: () => ({
+    async rpc(name, parameters) {
+      assert.equal(name, 'attendance_publish');
+      assert.equal(parameters.p_groups, null);
+      const names = Object.keys(parameters);
+      assert.ok(names.every(key => /^p_[a-z_]+$/.test(key)));
+      const args = names.map((key, i) => key + ' => $' + (i + 1)).join(',');
+      const { rows } = await service.query('SELECT public.attendance_publish(' + args + ') AS result', Object.values(parameters));
+      return { data: rows[0].result, error: null };
+    },
+  }) };
+  const common = loadSource('common/auth', { '@/storage/database/supabase-client': database });
+  const proof = loadSource('modules/attendance/attendance-proof', {});
+  const dependencies = {
+    '@/storage/database/supabase-client': database, '@/common/auth': common, './attendance-proof': proof,
+    '@/modules/attendance/attendance-proof': proof,
+  };
+  const { AttendanceService } = loadSource('modules/attendance/attendance.service', dependencies);
+  const { AgentService } = loadSource('modules/agent/agent.service', dependencies);
+  const agent = new AgentService(new AttendanceService());
+  agent.buildContext = async () => ({ courses: [{ id: 'course', name: '一号课程' }], tasks: [], location_presets: [{ id: 'library', name: '测试图书馆' }] });
+  const teacher = { id: 'teacher', role: 'teacher', name: '甲老师', student_no: null };
+  const create = async (mode, settings = {}, location) => {
+    agent.client.invoke = async () => ({ content: JSON.stringify({ type: 'confirm', tool: 'create_attendance',
+      arguments: { course_id: 'course', mode, duration_minutes: 7, late_minutes: 2, ...settings } }) });
+    return agent.chat(teacher, {}, { messages: [{ role: 'user', content: '发布签到' }], location });
+  };
+  for (const [mode, settings, attachment] of [
+    ['normal', {}], ['qr', {}], ['location', { location_preset_id: 'library', radius_m: 50 }],
+    ['location', { radius_m: 200 }, { latitude: 30, longitude: 120, accuracy: 10, captured_at_ms: Date.now() }],
+  ]) {
+    const before = await scalar('SELECT count(*)::int FROM attendance_tasks');
+    const pending = await create(mode, settings, attachment);
+    assert.equal(pending.type, 'confirm');
+    assert.equal(await scalar('SELECT count(*)::int FROM attendance_tasks'), before);
+    await agent.confirm(teacher, { pending_id: pending.pending_id });
+    const created = (await query('SELECT * FROM attendance_tasks ORDER BY created_at DESC LIMIT 1')).rows[0];
+    assert.equal(created.mode, mode);
+    assert.equal(created.group_snapshot.length, 4);
+    assert.equal((await report('teacher', created.id)).participants.length, 4);
+    assert.equal(new Date(created.normal_end_at) - new Date(created.start_at), 7 * 60_000);
+    assert.equal(new Date(created.end_at) - new Date(created.normal_end_at), 2 * 60_000);
+    if (mode === 'location') {
+      assert.equal(created.location_radius_m, settings.radius_m);
+      assert.equal(created.location_latitude, attachment?.latitude ?? 31);
+    }
+  }
+  const beforeMissing = await scalar('SELECT count(*)::int FROM attendance_tasks');
+  const missing = await create('location');
+  assert.equal(missing.type, 'reply');
+  assert.match(missing.content, /附带当前位置/);
+  assert.equal(await scalar('SELECT count(*)::int FROM attendance_tasks'), beforeMissing);
 });
