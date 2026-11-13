@@ -12,7 +12,9 @@ const attendanceArguments = z.object({
   course_id: z.string().trim().min(1).max(36),
   mode: z.enum(['normal', 'location', 'qr']),
   duration_minutes: z.coerce.number().int().min(1).max(1440).default(5),
-  late_minutes: z.coerce.number().int().min(0).max(1440).default(5),
+  late_minutes: z.number().int().min(0).max(1440).default(0),
+  all_groups: z.boolean().default(false),
+  group_ids: z.array(z.string().trim().min(1).max(36)).min(1).max(100).optional(),
   location_preset_id: z.string().trim().min(1).max(64).optional(),
   radius_m: z.union([z.literal(50), z.literal(100), z.literal(200)]).default(100),
 });
@@ -48,15 +50,23 @@ export class AgentService {
 
   constructor(private readonly attendanceService: AttendanceService) {}
 
-  async chat(user: AuthUser, headers: Record<string, any>, body: { messages?: ChatMessage[]; location?: unknown }) {
+  async chat(user: AuthUser, headers: Record<string, any>, body: {
+    messages?: ChatMessage[]; location?: unknown; location_supported?: boolean; location_preset_id?: string;
+  }) {
     requireTeacher(user);
     const messages = Array.isArray(body?.messages) ? body.messages : [];
     if (messages.length === 0) throw new BadRequestException('消息不能为空');
 
     const customHeaders = HeaderUtils.extractForwardHeaders(headers || {});
     const context = await this.buildContext(user);
+    const reply = (content: string) => ({ type: 'reply', content:
+      body.location_supported !== true && content.includes('附带当前位置')
+        ? '当前 WebView/H5 页面无法获取教师定位，请在本页选择已配置的预设建筑再发送；也可在原生微信小程序中定位。'
+        : content,
+    });
 
-    const system = this.buildSystemPrompt(user, context, body.location !== undefined);
+    const system = this.buildSystemPrompt(user, context, body.location !== undefined,
+      body.location_supported === true, body.location_preset_id);
     const llmMessages: Array<{ role: string; content: string }> = [
       { role: 'system', content: system },
       ...messages.map((m) => ({ role: m.role, content: m.content })),
@@ -69,15 +79,15 @@ export class AgentService {
         parsed = extractJson(raw);
       } catch (e) {
         // 若模型未按协议返回，直接作为文本回复
-        return { type: 'reply', content: raw };
+        return reply(raw);
       }
 
       if (parsed.type === 'reply') {
-        return { type: 'reply', content: String(parsed.content || '') };
+        return reply(String(parsed.content || ''));
       }
 
       if (parsed.type === 'clarify') {
-        return { type: 'reply', content: String(parsed.question || '请补充更多信息') };
+        return reply(String(parsed.question || '请补充更多信息'));
       }
 
       if (parsed.type === 'confirm') {
@@ -85,11 +95,19 @@ export class AgentService {
         let summary = String(parsed.summary || '请确认是否执行该操作');
         if (parsed.tool === 'create_attendance') {
           try {
-            args = this.prepareAttendance(args, body.location);
+            args = this.prepareAttendance({ ...args,
+              location_preset_id: body.location_preset_id ?? args.location_preset_id,
+            }, body.location);
             const course = context.courses.find(course => course.id === args.course_id);
             if (!course) throw new BadRequestException('请选择你负责的课程后再发布签到');
+            const groups = course.groups ?? [];
+            const selectedGroups = groups.filter(group => args.group_ids?.includes(group.id));
+            if (!args.all_groups && selectedGroups.length !== args.group_ids.length) {
+              throw new BadRequestException('教学班不存在或不属于所选课程，请核对课程和教学班后重试');
+            }
+            const scope = args.all_groups ? '全部教学班' : selectedGroups.map(group => `「${group.name}」`).join('、');
             const late = args.late_minutes === 0 ? '关闭迟到窗口' : `迟到窗口 ${args.late_minutes} 分钟`;
-            summary = `发布${ATTENDANCE_MODES[args.mode]}，课程「${course.name}」的全部教学班，正常签到 ${args.duration_minutes} 分钟，${late}`;
+            summary = `发布${ATTENDANCE_MODES[args.mode]}，课程「${course.name}」的${scope}，正常签到 ${args.duration_minutes} 分钟，${late}，共 ${args.duration_minutes + args.late_minutes} 分钟后截止`;
             if (args.mode === 'location') {
               const preset = args.location_preset_id === undefined ? undefined
                 : locationPresets().find(item => item.id === args.location_preset_id);
@@ -97,7 +115,7 @@ export class AgentService {
               summary += `，中心为${center}，半径 ${args.radius_m} 米`;
             }
           } catch (error) {
-            if (error instanceof HttpException) return { type: 'reply', content: error.message };
+            if (error instanceof HttpException) return reply(error.message);
             throw error;
           }
         }
@@ -133,7 +151,7 @@ export class AgentService {
       }
 
       // 未知 type，作为文本回复
-      return { type: 'reply', content: raw };
+      return reply(raw);
     }
 
     return { type: 'reply', content: '处理步骤过多，请换个方式描述您的需求。' };
@@ -195,11 +213,11 @@ export class AgentService {
   private async executeWriteTool(tool: string, args: any, user: AuthUser) {
     switch (tool) {
       case 'create_attendance':
-        return this.attendanceService.createTask(user, this.prepareAttendance(args, args?.location), true);
+        return this.attendanceService.createTask(user, this.prepareAttendance(args, args?.location), args?.all_groups === true);
       case 'makeup_attendance':
         return this.attendanceService.makeup(user, args?.task_id, {
           student_no: args?.student_no,
-          reason: args?.reason || '（未填写原因）',
+          reason: args?.reason,
         });
       default:
         throw new Error(`未知操作: ${tool}`);
@@ -209,14 +227,20 @@ export class AgentService {
   private prepareAttendance(args: unknown, teacherLocation?: unknown) {
     const input = attendanceArguments.safeParse(args);
     if (!input.success) {
-      throw new BadRequestException('请明确签到类型（普通、位置或二维码），并提供有效的课程、时长和半径（50、100 或 200 米）');
+      throw new BadRequestException('请明确签到类型（普通、位置或二维码）、课程和教学班，并提供有效时长和半径（50、100 或 200 米）');
     }
     const parameters = input.data;
+    if (parameters.all_groups ? parameters.group_ids !== undefined : !parameters.group_ids?.length) {
+      throw new BadRequestException('请明确选择一个或多个教学班，或明确要求课程全部教学班');
+    }
+    if (parameters.group_ids && new Set(parameters.group_ids).size !== parameters.group_ids.length) {
+      throw new BadRequestException('教学班选择有重复，请核对后重试');
+    }
     if (parameters.mode === 'qr') requireQrSecret();
     if (parameters.mode !== 'location') return parameters;
     if (parameters.location_preset_id !== undefined) {
       if (!locationPresets().some(item => item.id === parameters.location_preset_id)) {
-        throw new BadRequestException('预设建筑不可用，请选择可用建筑或附带教师当前位置后重新发送');
+        throw new BadRequestException('预设建筑不可用，请在本页选择可用预设建筑后重新发送');
       }
       return parameters;
     }
@@ -225,7 +249,7 @@ export class AgentService {
     const now = Date.now();
     if (!location.success || location.data.accuracy > parameters.radius_m
       || location.data.captured_at_ms < now - 60_000 || location.data.captured_at_ms > now + 15_000) {
-      throw new BadRequestException('位置签到需要有效位置。请点击「附带当前位置」重新定位并发送，或指定已配置的建筑及半径');
+      throw new BadRequestException('位置签到需要有效位置。请在本页选择预设建筑；原生微信小程序中可重新定位后再发送');
     }
     return { ...parameters, location: location.data };
   }
@@ -234,7 +258,7 @@ export class AgentService {
     const client = getSupabaseClient();
     const { data, error } = await client
       .from('courses')
-      .select('id, name')
+      .select('id, name, groups:teaching_groups(id,name)')
       .eq('teacher_user_id', user.id)
       .order('created_at', { ascending: false });
     if (error) throw new Error(error.message);
@@ -305,13 +329,15 @@ export class AgentService {
 
   private buildSystemPrompt(
     user: AuthUser,
-    context: { courses: Array<{ id: string; name: string }>; tasks: any[]; location_presets: Array<{ id: string; name: string }> },
+    context: { courses: Array<{ id: string; name: string; groups?: Array<{ id: string; name: string }> }>; tasks: any[]; location_presets: Array<{ id: string; name: string }> },
     hasTeacherLocation: boolean,
+    locationSupported: boolean,
+    selectedPreset?: string,
   ): string {
     const coursesBlock =
       context.courses.length === 0
         ? '（暂无课程）'
-        : context.courses.map((c) => `- ${c.name}（id=${c.id}）`).join('\n');
+        : context.courses.map((c) => `- ${c.name}（id=${c.id}），教学班：${(c.groups ?? []).map(group => `${group.name}（id=${group.id}）`).join('、') || '暂无'}`).join('\n');
 
     const tasksBlock =
       context.tasks.length === 0
@@ -343,16 +369,17 @@ export class AgentService {
 - list_roster：参数 {course_id}。返回课程名单。
 - get_attendance：参数 {task_id}。返回某次签到的统计与每个学生状态。
 - get_absentees：参数 {task_id}。返回任务状态、尚未签到名单（unsigned）和缺勤名单（absentees）。
-- create_attendance：参数 {course_id, mode, duration_minutes, late_minutes?, location_preset_id?, radius_m?}。mode 必填，仅允许 normal（普通签到）、location（位置签到）、qr（动态二维码签到），覆盖课程全部教学班（写，需确认）。正常时长默认 5 分钟，迟到时长默认 5 分钟，late_minutes=0 关闭迟到窗口。
-- location 模式必须有本轮附带的教师定位，或当前上下文中真实存在且由教师选定的建筑 location_preset_id。radius_m 可选 50、100、200 米，默认 100 米。不得生成或猜测坐标，不得把文本描述当作有效定位。缺少位置条件时用 clarify 询问建筑，或引导点击「附带当前位置」再发送。
+- create_attendance：参数 {course_id, mode, duration_minutes, late_minutes?, group_ids?, all_groups?, location_preset_id?, radius_m?}。mode 必填，仅允许 normal（普通签到）、location（位置签到）、qr（动态二维码签到）（写，需确认）。正常时长默认 5 分钟。教师没有明确要求迟到窗口时 late_minutes 必须为 0，正常时段结束后完全截止；例如「发布5分钟签到」只开放5分钟。明确要求迟到时才设置所要求的分钟数，时长不明确先询问。
+- 教师指定一个或多个教学班时，将上下文中的真实 ID 放入 group_ids，all_groups=false；只有明确要求课程全部教学班时 all_groups=true 且省略 group_ids。不得把指定教学班扩大为全部教学班。课程或教学班名称有歧义、未指定范围、名称或 ID 不匹配时用 clarify 询问，不得猜测或选取相近名称。
+- location 模式必须有本轮附带的教师定位，或当前上下文中真实存在且由教师选定的建筑 location_preset_id。radius_m 可选 50、100、200 米，默认 100 米。不得生成或猜测坐标，不得把文本描述当作有效定位。缺少位置条件时用 clarify 询问预设建筑。只有下方声明定位入口可用时，才能引导点击「附带当前位置」。WebView/H5 未接入定位时应说明限制并引导在本页选择预设建筑。
 - normal 和 qr 模式不需要位置。qr 签发任务共用的动态二维码。
-- makeup_attendance：参数 {task_id, student_no, reason}。补签（写，需确认）。
+- makeup_attendance：参数 {task_id, student_no, reason?}。补签（写，需确认），原因选填，不得编造理由。
 
 ## 规则
 - 数据必须来自工具真实返回，禁止编造。
 - 签到进行中，unsigned 表述为「尚未签到」，absentees 表述为「教师已标记缺勤」，两份名单分开说明。任务已结束时，absentees 表述为「最终缺勤」。对 get_attendance 的同类状态也使用这些表述。
 - 发布签到、补签等写操作，必须用 type=confirm 请求老师确认并给出 summary。
-- 按教师要求识别三种签到方式并原样传递 mode。指定类型无法发布时明确说明原因，禁止改成其他类型。发布确认须说明实际签到类型、课程全部教学班、正常/迟到时长；位置签到还须说明位置来源和半径。
+- 按教师要求识别三种签到方式并原样传递 mode。指定类型无法发布时明确说明原因，禁止改成其他类型。发布确认须说明实际签到类型、课程、所选教学班、正常/迟到时长和总截止时间；位置签到还须说明位置来源和半径。
 - 「普通签到」对应 normal，「定位/位置签到」对应 location，「扫码/二维码签到」对应 qr。教师未指定方式时使用 normal；已指定方式时必须保留。
 - 读操作用 type=query 执行；拿到结果后可继续 query，最后用 type=reply 总结真实数据。
 - 课程名与 id 的对照见【当前上下文】，找不到再调用 list_courses / list_recent_tasks。
@@ -361,7 +388,9 @@ export class AgentService {
 
 ## 当前上下文（教师：${user.name}）
 本轮教师定位附件：${hasTeacherLocation ? '已附带，发布前由服务端校验' : '未附带'}。
-可用预设建筑：${context.location_presets.map(item => `${item.name}（id=${item.id}）`).join('、') || '暂无；请使用教师当前位置'}。
+当前页面定位入口：${locationSupported ? '原生微信小程序，可点击「附带当前位置」' : '不可用，WebView/H5 请在本页选择预设建筑，不能引导点击定位按钮'}。
+本轮教师选择的预设建筑 ID：${selectedPreset ?? '未选择'}。
+可用预设建筑：${context.location_presets.map(item => `${item.name}（id=${item.id}）`).join('、') || '暂无；当前环境无法定位时请联系管理员配置预设建筑'}。
 
 课程：
 ${coursesBlock}

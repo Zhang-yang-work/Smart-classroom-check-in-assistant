@@ -219,18 +219,19 @@ export class AttendanceService {
     return this.change(user.id, taskId, 'end');
   }
 
-  adjust(user: AuthUser, taskId: string, body: { student_no: string; reason: string; status: FinalStatus }) {
+  adjust(user: AuthUser, taskId: string, body: { student_no: string; reason?: string | null; status: FinalStatus }) {
     requireTeacher(user);
     const student = typeof body?.student_no === 'string' ? body.student_no.trim() : '';
-    const reason = typeof body?.reason === 'string' ? body.reason.trim() : '';
-    if (!student || !reason || reason.length > 256 || !FINAL_STATUSES.includes(body?.status)) {
-      throw new BadRequestException('请选择考勤状态并填写调整原因（最多 256 字）');
+    const reason = typeof body?.reason === 'string' ? body.reason.trim() || null : null;
+    if (!student || (body?.reason != null && typeof body.reason !== 'string')
+      || (reason?.length ?? 0) > 256 || !FINAL_STATUSES.includes(body?.status)) {
+      throw new BadRequestException('请选择考勤状态，调整原因选填且最多 256 字');
     }
     return this.change(user.id, taskId, 'adjust', student, body.status, reason);
   }
 
   // The existing Agent tool still records a manual present result.
-  makeup(user: AuthUser, taskId: string, body: { student_no: string; reason: string }) {
+  makeup(user: AuthUser, taskId: string, body: { student_no: string; reason?: string | null }) {
     return this.adjust(user, taskId, { ...body, status: 'present' });
   }
 

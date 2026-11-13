@@ -91,7 +91,7 @@ beforeEach(() => {
           if (request.body) {
             const body = JSON.parse(init.body);
             if (Array.isArray(request.body)) assert.deepEqual(body, request.body);
-            else for (const [key, value] of Object.entries(request.body)) assert.equal(body[key], value);
+            else for (const [key, value] of Object.entries(request.body)) assert.deepEqual(body[key], value);
           }
           return Response.json(request.data);
         } catch (error) {
@@ -209,12 +209,26 @@ test('合法签到和补签仍写入对应考勤及操作日志', async () => {
   assert.equal((await attendance.makeup(teacher, 'task-a', { student_no: '002', reason: '补签' })).status, 'present');
 });
 
-async function chat(proposal, location) {
-  expectQuery('courses', { teacher_user_id: 'eq.teacher-a', select: 'id,name' }, [{ id: 'course-a', name: '课程 A' }]);
+test('教师四种考勤调整允许空原因，且不伪造理由', async () => {
+  for (const status of ['present', 'late', 'excused', 'absent']) {
+    for (const reason of [undefined, null, '', '  ']) {
+      expectQuery('rpc/attendance_change', {}, { status }, 'POST', {
+        p_actor: teacher.id, p_action: 'adjust', p_student: '001', p_status: status, p_reason: null,
+      });
+      assert.equal((await attendance.adjust(teacher, task.id, { student_no: '001', status, reason })).status, status);
+    }
+  }
+  assert.throws(() => attendance.adjust(teacher, task.id, { student_no: '001', status: 'absent', reason: 'x'.repeat(257) }), /最多 256/);
+});
+
+async function chat(proposal, location, options = {}) {
+  expectQuery('courses', { teacher_user_id: 'eq.teacher-a', select: 'id,name,groups:teaching_groups(id,name)' }, [
+    { id: 'course-a', name: '课程 A', groups: [{ id: 'group-1', name: '教学一班' }, { id: 'group-2', name: '教学二班' }] },
+  ]);
   expectQuery('courses', { teacher_user_id: 'eq.teacher-a', select: 'id,name' }, []);
   model.mock.mockImplementationOnce(async () => ({ content: JSON.stringify(proposal) }));
   model.mock.mockImplementation(async () => ({ content: '{"type":"reply","content":"查询结束"}' }));
-  return agent.chat(teacher, { headers: {} }, { messages: [{ role: 'user', content: '测试工具调用' }], location });
+  return agent.chat(teacher, { headers: {} }, { messages: [{ role: 'user', content: '测试工具调用' }], location, ...options });
 }
 
 function toolResult(tool) {
@@ -290,7 +304,7 @@ test('Agent 三种签到传递实际类型、覆盖全部教学班并展示真�
     else process.env.ATTENDANCE_LOCATION_PRESETS = oldPresets;
   });
   for (const [mode, label] of [['normal', '普通签到'], ['location', '位置签到'], ['qr', '二维码签到']]) {
-    const parameters = { course_id: 'course-a', duration_minutes: 7, late_minutes: 0, mode };
+    const parameters = { course_id: 'course-a', duration_minutes: 7, late_minutes: 0, mode, all_groups: true };
     if (mode === 'location') Object.assign(parameters, { location_preset_id: 'library', radius_m: 50 });
     const proposal = await chat({
       type: 'confirm', tool: 'create_attendance', arguments: parameters, summary: '模型给出的错误类型和时长',
@@ -321,12 +335,12 @@ test('Agent 三种签到传递实际类型、覆盖全部教学班并展示真�
 test('Agent 位置签到只使用显式定位附件并在确认执行时重新检查有效期', async () => {
   const location = { latitude: 31.987654, longitude: 121.987654, accuracy: 20, captured_at_ms: Date.now() };
   const proposal = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
-    course_id: 'course-a', mode: 'location', location: { latitude: 0, longitude: 0, accuracy: 1 },
+    course_id: 'course-a', mode: 'location', all_groups: true, location: { latitude: 0, longitude: 0, accuracy: 1 },
   } }, location);
   assert.equal(proposal.type, 'confirm');
   assert.equal(proposal.arguments.radius_m, 100);
   assert.deepEqual(proposal.arguments.location, location);
-  assert.match(proposal.summary, /位置签到.*5 分钟.*迟到窗口 5 分钟.*31\.987654.*100 米/);
+  assert.match(proposal.summary, /位置签到.*5 分钟.*关闭迟到窗口.*31\.987654.*100 米/);
   assert.ok(!JSON.stringify(model.mock.calls[0].arguments[0]).includes('31.987654'));
   expectQuery('rpc/attendance_publish', {}, { ...task, mode: 'location', total: 2 }, 'POST', {
     p_mode: 'location', p_groups: null, p_lat: location.latitude, p_lng: location.longitude, p_radius: 100,
@@ -334,7 +348,7 @@ test('Agent 位置签到只使用显式定位附件并在确认执行时重新�
   await agent.confirm(teacher, { pending_id: proposal.pending_id });
   model.mock.resetCalls();
   const expiring = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
-    course_id: 'course-a', mode: 'location',
+    course_id: 'course-a', mode: 'location', all_groups: true,
   } }, location);
   mock.method(Date, 'now', () => location.captured_at_ms + 60_001);
   try {
@@ -349,12 +363,12 @@ test('Agent 缺少或无效定位、建筑、半径、类型及二维码配置�
     if (previous === undefined) delete process.env.ATTENDANCE_QR_SECRET;
     else process.env.ATTENDANCE_QR_SECRET = previous;
   });
-  const valid = { course_id: 'course-a', mode: 'location' };
+  const valid = { course_id: 'course-a', mode: 'location', all_groups: true };
   const location = { latitude: 31, longitude: 121, accuracy: 10, captured_at_ms: Date.now() };
   const cases = [
-    [valid, undefined, /附带当前位置/],
-    [{ ...valid, location }, undefined, /附带当前位置/],
-    [valid, { ...location, latitude: 91 }, /附带当前位置/],
+    [valid, undefined, /预设建筑/],
+    [{ ...valid, location }, undefined, /预设建筑/],
+    [valid, { ...location, latitude: 91 }, /预设建筑/],
     [valid, { ...location, captured_at_ms: Date.now() - 61_000 }, /重新定位/],
     [{ ...valid, radius_m: 50 }, { ...location, accuracy: 80 }, /重新定位/],
     [{ ...valid, location_preset_id: 'missing' }, undefined, /预设建筑不可用/],
@@ -370,6 +384,67 @@ test('Agent 缺少或无效定位、建筑、半径、类型及二维码配置�
     assert.match(result.content, message);
     model.mock.resetCalls();
   }
+});
+
+test('Agent 指定单班或多班原样传参，未提迟到为零，确认卡显示真实班名', async () => {
+  for (const [groupIds, late] of [[['group-1'], undefined], [['group-1','group-2'], 3]]) {
+    const pending = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
+      course_id: 'course-a', mode: 'normal', group_ids: groupIds, duration_minutes: 5,
+      ...(late === undefined ? {} : { late_minutes: late }),
+    } });
+    assert.equal(pending.type, 'confirm');
+    assert.match(pending.summary, /课程 A.*教学一班.*普通|普通签到.*课程 A.*教学一班/);
+    assert.equal(pending.summary.includes('全部教学班'), false);
+    assert.equal(pending.summary.includes('教学二班'), groupIds.length === 2);
+    assert.match(pending.summary, late === undefined ? /关闭迟到窗口.*5 分钟后截止/ : /迟到窗口 3 分钟.*8 分钟后截止/);
+    expectQuery('rpc/attendance_publish', {}, { ...task, total: 2 }, 'POST', {
+      p_groups: groupIds, p_late: late ?? 0, p_normal: 5,
+    });
+    await agent.confirm(teacher, { pending_id: pending.pending_id });
+    const prompt = model.mock.calls[0].arguments[0][0].content;
+    assert.match(prompt, /教学一班（id=group-1）.*教学二班（id=group-2）/);
+    model.mock.resetCalls();
+  }
+});
+
+test('Agent 范围不明、冲突或跨课程教学班时询问或拒绝，绝不改成全部', async () => {
+  for (const selection of [{}, { group_ids: ['foreign-group'] }, { all_groups: true, group_ids: ['group-1'] }, { group_ids: ['group-1','group-1'] }]) {
+    const result = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
+      course_id: 'course-a', mode: 'normal', ...selection,
+    } });
+    assert.equal(result.type, 'reply');
+    assert.equal(result.pending_id, undefined);
+    assert.match(result.content, /教学班/);
+    model.mock.resetCalls();
+  }
+});
+
+test('教师手动发布仍保留原有迟到窗口默认值', async () => {
+  expectQuery('rpc/attendance_publish', {}, { ...task, total: 2 }, 'POST', {
+    p_groups: ['group-1'], p_normal: 5, p_late: 5,
+  });
+  assert.equal((await attendance.create(teacher, {
+    course_id: 'course-a', group_ids: ['group-1'], mode: 'normal', duration_minutes: 5,
+  })).id, task.id);
+});
+
+test('Agent 在 WebView 不指向定位按钮，选择建筑可直接发布且使用真实预设', async t => {
+  const previous = process.env.ATTENDANCE_LOCATION_PRESETS;
+  process.env.ATTENDANCE_LOCATION_PRESETS = JSON.stringify([{ id: 'library', name: '图书馆', latitude: 31, longitude: 121 }]);
+  t.after(() => { if(previous === undefined) delete process.env.ATTENDANCE_LOCATION_PRESETS; else process.env.ATTENDANCE_LOCATION_PRESETS=previous; });
+  const guide = await chat({ type: 'clarify', question: '请点击附带当前位置' }, undefined, { location_supported: false });
+  assert.match(guide.content, /WebView\/H5.*预设建筑/);
+  assert.equal(guide.content.includes('附带当前位置'), false);
+  model.mock.resetCalls();
+  const pending = await chat({ type: 'confirm', tool: 'create_attendance', arguments: {
+    course_id: 'course-a', mode: 'location', group_ids: ['group-1'],
+  } }, undefined, { location_supported: false, location_preset_id: 'library' });
+  assert.equal(pending.type, 'confirm');
+  assert.match(pending.summary, /图书馆.*100 米/);
+  expectQuery('rpc/attendance_publish', {}, { ...task, mode: 'location' }, 'POST', {
+    p_groups: ['group-1'], p_mode: 'location', p_lat: 31, p_lng: 121, p_late: 0,
+  });
+  await agent.confirm(teacher, { pending_id: pending.pending_id });
 });
 
 test('二维码只为有权教师签发，签名绑定任务和有效期', async t => {

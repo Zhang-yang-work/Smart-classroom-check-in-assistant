@@ -85,10 +85,12 @@ test('Agent API 传递显式定位附件且日志不输出坐标', async () => {
   }, { console: { log: (...args) => logs.push(args) } });
   const messages = [{ role: 'user', content: '发布位置签到' }];
   const location = { latitude: 31.987654, longitude: 121.987654, accuracy: 10, captured_at_ms: Date.now() };
-  await api.agentChat(messages, location);
+  await api.agentChat(messages, location, { location_supported: false, location_preset_id: 'library' });
   assert.equal(received[0].url, '/api/agent/chat');
   assert.equal(received[0].data.messages, messages);
   assert.equal(received[0].data.location, location);
+  assert.equal(received[0].data.location_supported, false);
+  assert.equal(received[0].data.location_preset_id, 'library');
   assert.equal(received[0].header.Authorization, 'Bearer test-session');
   assert.doesNotMatch(JSON.stringify(logs), /31\.987654|121\.987654|test-session/);
 });
